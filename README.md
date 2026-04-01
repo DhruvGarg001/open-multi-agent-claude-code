@@ -1,31 +1,27 @@
 # Open Multi-Agent
 
-Open Multi-Agent is an open-source multi-agent orchestration framework. Build autonomous AI agent teams that can collaborate, communicate, schedule tasks with dependencies, and execute complex multi-step workflows — all model-agnostic.
-
-Unlike single-agent SDKs like `@anthropic-ai/claude-agent-sdk` which run one agent per process, Open Multi-Agent orchestrates **multiple specialized agents** working together in-process — deploy anywhere: cloud servers, serverless functions, Docker containers, CI/CD pipelines.
+Build AI agent teams that work together. One agent plans, another implements, a third reviews — the framework handles task scheduling, dependencies, and communication automatically.
 
 [![npm version](https://img.shields.io/npm/v/open-multi-agent)](https://www.npmjs.com/package/open-multi-agent)
+[![npm downloads](https://img.shields.io/npm/dm/open-multi-agent)](https://www.npmjs.com/package/open-multi-agent)
+[![GitHub stars](https://img.shields.io/github/stars/JackChen-me/open-multi-agent)](https://github.com/JackChen-me/open-multi-agent/stargazers)
 [![license](https://img.shields.io/npm/l/open-multi-agent)](./LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-blue)](https://www.typescriptlang.org/)
 
-## Features
+## Why Open Multi-Agent?
 
-- **Multi-Agent Teams** — Create teams of specialized agents that collaborate toward a shared goal
-- **Automatic Orchestration** — Describe a goal in plain English; the framework decomposes it into tasks and assigns them
-- **Task Dependencies** — Define tasks with `dependsOn` chains; the `TaskQueue` resolves them topologically
-- **Inter-Agent Communication** — Agents message each other via `MessageBus` and share knowledge through `SharedMemory`
-- **Model Agnostic** — Works with Anthropic Claude, OpenAI GPT, or any custom `LLMAdapter`
-- **Tool Framework** — Define custom tools with Zod schemas, or use 5 built-in tools (bash, file_read, file_write, file_edit, grep)
-- **Parallel Execution** — Independent tasks run concurrently with configurable `maxConcurrency`
-- **4 Scheduling Strategies** — Round-robin, least-busy, capability-match, dependency-first
-- **Streaming** — Stream incremental text deltas from any agent via `AsyncGenerator<StreamEvent>`
-- **Full Type Safety** — Strict TypeScript with Zod validation throughout
+- **Multi-Agent Teams** — Define agents with different roles, tools, and even different models. They collaborate through a message bus and shared memory.
+- **Task DAG Scheduling** — Tasks have dependencies. The framework resolves them topologically — dependent tasks wait, independent tasks run in parallel.
+- **Model Agnostic** — Claude and GPT in the same team. Swap models per agent. Bring your own adapter for any LLM.
+- **In-Process Execution** — No subprocess overhead. Everything runs in one Node.js process. Deploy to serverless, Docker, CI/CD.
 
 ## Quick Start
 
 ```bash
 npm install open-multi-agent
 ```
+
+Set `ANTHROPIC_API_KEY` (and optionally `OPENAI_API_KEY`) in your environment.
 
 ```typescript
 import { OpenMultiAgent } from 'open-multi-agent'
@@ -45,11 +41,9 @@ const result = await orchestrator.runAgent(
 console.log(result.output)
 ```
 
-Set `ANTHROPIC_API_KEY` (and optionally `OPENAI_API_KEY`) in your environment before running.
+## Multi-Agent Team
 
-## Usage
-
-### Multi-Agent Team
+This is where it gets interesting. Three agents, one goal:
 
 ```typescript
 import { OpenMultiAgent } from 'open-multi-agent'
@@ -94,9 +88,10 @@ console.log(`Success: ${result.success}`)
 console.log(`Tokens: ${result.totalTokenUsage.output_tokens} output tokens`)
 ```
 
-### Task Pipeline
+## More Examples
 
-Use `runTasks()` when you want explicit control over the task graph and assignments:
+<details>
+<summary><b>Task Pipeline</b> — explicit control over task graph and assignments</summary>
 
 ```typescript
 const result = await orchestrator.runTasks(team, [
@@ -126,7 +121,10 @@ const result = await orchestrator.runTasks(team, [
 ])
 ```
 
-### Custom Tools
+</details>
+
+<details>
+<summary><b>Custom Tools</b> — define tools with Zod schemas</summary>
 
 ```typescript
 import { z } from 'zod'
@@ -159,7 +157,10 @@ const agent = new Agent(
 const result = await agent.run('Find the three most recent TypeScript releases.')
 ```
 
-### Multi-Model Teams
+</details>
+
+<details>
+<summary><b>Multi-Model Teams</b> — mix Claude and GPT in one workflow</summary>
 
 ```typescript
 const claudeAgent: AgentConfig = {
@@ -187,7 +188,10 @@ const team = orchestrator.createTeam('mixed-team', {
 const result = await orchestrator.runTeam(team, 'Build a CLI tool that converts JSON to CSV.')
 ```
 
-### Streaming Output
+</details>
+
+<details>
+<summary><b>Streaming Output</b></summary>
 
 ```typescript
 import { Agent, ToolRegistry, ToolExecutor, registerBuiltInTools } from 'open-multi-agent'
@@ -208,6 +212,8 @@ for await (const event of agent.stream('Explain monads in two sentences.')) {
   }
 }
 ```
+
+</details>
 
 ## Architecture
 
@@ -259,17 +265,13 @@ for await (const event of agent.stream('Explain monads in two sentences.')) {
 | `file_edit` | Edit a file by replacing an exact string match. |
 | `grep` | Search file contents with regex. Uses ripgrep when available, falls back to Node.js. |
 
-## Design Inspiration
+## Contributing
 
-The architecture draws from common multi-agent orchestration patterns seen in modern AI coding tools.
+Issues, feature requests, and PRs are welcome. Some areas where contributions would be especially valuable:
 
-| Pattern | open-multi-agent | What it does |
-|---------|-----------------|--------------|
-| Conversation loop | `AgentRunner` | Drives the model → tool → model turn loop |
-| Tool definition | `defineTool()` | Typed tool definition with Zod validation |
-| Coordinator | `OpenMultiAgent` | Decomposes goals, assigns tasks, manages concurrency |
-| Team / sub-agent | `Team` + `MessageBus` | Inter-agent communication and shared state |
-| Task scheduling | `TaskQueue` | Topological task scheduling with dependency resolution |
+- **LLM Adapters** — Ollama, llama.cpp, vLLM, Gemini. The `LLMAdapter` interface requires just two methods: `chat()` and `stream()`.
+- **Examples** — Real-world workflows and use cases.
+- **Documentation** — Guides, tutorials, and API docs.
 
 ## Star History
 
