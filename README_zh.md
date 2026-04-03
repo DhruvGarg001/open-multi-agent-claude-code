@@ -1,8 +1,8 @@
 # Open Multi-Agent
 
-构建能自动拆解目标的 AI 智能体团队。定义智能体的角色和工具，描述一个目标——框架自动规划任务图、调度依赖、并行执行。
+TypeScript 多智能体编排框架。一次 `runTeam()` 调用从目标到结果——框架自动拆解任务、解析依赖、并行执行。
 
-3 个运行时依赖，27 个源文件，一次 `runTeam()` 调用从目标到结果。
+3 个运行时依赖 · 27 个源文件 · Node.js 能跑的地方都能部署
 
 [![GitHub stars](https://img.shields.io/github/stars/JackChen-me/open-multi-agent)](https://github.com/JackChen-me/open-multi-agent/stargazers)
 [![license](https://img.shields.io/github/license/JackChen-me/open-multi-agent)](./LICENSE)
@@ -12,14 +12,14 @@
 
 ## 为什么选择 Open Multi-Agent？
 
-- **自动任务拆解** — 用自然语言描述目标，内置的协调者智能体自动将其拆解为带依赖关系和分配的任务图——无需手动编排。
-- **多智能体团队** — 定义不同角色、工具甚至不同模型的智能体。它们通过消息总线和共享内存协作。
-- **任务 DAG 调度** — 任务之间存在依赖关系。框架进行拓扑排序——有依赖的任务等待，无依赖的任务并行执行。
+- **目标进，结果出** — `runTeam(team, "构建一个 REST API")`。协调者智能体自动将目标拆解为带依赖关系的任务图，分配给对应智能体，独立任务并行执行，最终合成输出。无需手动定义任务或编排流程图。
+- **TypeScript 原生** — 为 Node.js 生态而生。`npm install` 即用，无需 Python 运行时、无子进程桥接、无额外基础设施。可嵌入 Express、Next.js、Serverless 函数或 CI/CD 流水线。
+- **可审计、极轻量** — 3 个运行时依赖（`@anthropic-ai/sdk`、`openai`、`zod`），27 个源文件。一个下午就能读完全部源码。
 - **模型无关** — Claude、GPT、Gemma 4 和本地模型（Ollama、vLLM、LM Studio）可以在同一个团队中使用。通过 `baseURL` 即可接入任何 OpenAI 兼容服务。
+- **多智能体协作** — 定义不同角色、工具和模型的智能体，通过消息总线和共享内存协作。
 - **结构化输出** — 为任意智能体添加 `outputSchema`（Zod），输出自动解析为 JSON 并校验，校验失败自动重试一次。通过 `result.structured` 获取类型化结果。
 - **任务重试** — 为任务设置 `maxRetries`，失败时自动指数退避重试。所有尝试的 token 用量累计，确保计费准确。
 - **可观测性** — 可选的 `onTrace` 回调为每次 LLM 调用、工具执行、任务和智能体运行发出结构化 span 事件——包含耗时、token 用量和共享的 `runId` 用于关联追踪。未订阅时零开销，零额外依赖。
-- **进程内执行** — 没有子进程开销。所有内容在一个 Node.js 进程中运行。可部署到 Serverless、Docker、CI/CD。
 
 ## 快速开始
 

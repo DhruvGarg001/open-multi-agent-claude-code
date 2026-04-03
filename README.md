@@ -1,8 +1,8 @@
 # Open Multi-Agent
 
-Build AI agent teams that decompose goals into tasks automatically. Define agents with roles and tools, describe a goal — the framework plans the task graph, schedules dependencies, and runs everything in parallel.
+TypeScript framework for multi-agent orchestration. One `runTeam()` call from goal to result — the framework decomposes it into tasks, resolves dependencies, and runs agents in parallel.
 
-3 runtime dependencies. 27 source files. One `runTeam()` call from goal to result.
+3 runtime dependencies · 27 source files · Deploys anywhere Node.js runs
 
 [![GitHub stars](https://img.shields.io/github/stars/JackChen-me/open-multi-agent)](https://github.com/JackChen-me/open-multi-agent/stargazers)
 [![license](https://img.shields.io/github/license/JackChen-me/open-multi-agent)](./LICENSE)
@@ -12,14 +12,14 @@ Build AI agent teams that decompose goals into tasks automatically. Define agent
 
 ## Why Open Multi-Agent?
 
-- **Auto Task Decomposition** — Describe a goal in plain text. A built-in coordinator agent breaks it into a task DAG with dependencies and assignees — no manual orchestration needed.
-- **Multi-Agent Teams** — Define agents with different roles, tools, and even different models. They collaborate through a message bus and shared memory.
-- **Task DAG Scheduling** — Tasks have dependencies. The framework resolves them topologically — dependent tasks wait, independent tasks run in parallel.
+- **Goal In, Result Out** — `runTeam(team, "Build a REST API")`. A coordinator agent auto-decomposes the goal into a task DAG with dependencies and assignees, runs independent tasks in parallel, and synthesizes the final output. No manual task definitions or graph wiring required.
+- **TypeScript-Native** — Built for the Node.js ecosystem. `npm install`, import, run. No Python runtime, no subprocess bridge, no sidecar services. Embed in Express, Next.js, serverless functions, or CI/CD pipelines.
+- **Auditable and Lightweight** — 3 runtime dependencies (`@anthropic-ai/sdk`, `openai`, `zod`). 27 source files. The entire codebase is readable in an afternoon.
 - **Model Agnostic** — Claude, GPT, Gemma 4, and local models (Ollama, vLLM, LM Studio) in the same team. Swap models per agent via `baseURL`.
+- **Multi-Agent Collaboration** — Agents with different roles, tools, and models collaborate through a message bus and shared memory.
 - **Structured Output** — Add `outputSchema` (Zod) to any agent. Output is parsed as JSON, validated, and auto-retried once on failure. Access typed results via `result.structured`.
 - **Task Retry** — Set `maxRetries` on tasks for automatic retry with exponential backoff. Failed attempts accumulate token usage for accurate billing.
 - **Observability** — Optional `onTrace` callback emits structured spans for every LLM call, tool execution, task, and agent run — with timing, token usage, and a shared `runId` for correlation. Zero overhead when not subscribed, zero extra dependencies.
-- **In-Process Execution** — No subprocess overhead. Everything runs in one Node.js process. Deploy to serverless, Docker, CI/CD.
 
 ## Quick Start
 
