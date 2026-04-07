@@ -238,7 +238,10 @@ describe('token budget enforcement', () => {
       sharedMemory: false,
     })
 
-    const result = await oma.runTeam(team, 'Do work')
+    // Use a goal that explicitly mentions sequencing so the short-circuit
+    // path is skipped and the coordinator decomposition + execution flow
+    // (which this test is exercising) actually runs.
+    const result = await oma.runTeam(team, 'First plan the work, then execute it')
     expect(result.totalTokenUsage.input_tokens + result.totalTokenUsage.output_tokens).toBe(70)
     expect(events.some(e => e.type === 'budget_exceeded')).toBe(true)
   })

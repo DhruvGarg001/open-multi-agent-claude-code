@@ -15,6 +15,7 @@
 
 import type { AgentConfig, Task } from '../types.js'
 import type { TaskQueue } from '../task/queue.js'
+import { extractKeywords, keywordScore } from '../utils/keywords.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -72,38 +73,6 @@ function countBlockedDependents(taskId: string, allTasks: Task[]): number {
   }
   // Exclude the seed task itself from the count
   return visited.size
-}
-
-/**
- * Compute a simple keyword-overlap score between `text` and `keywords`.
- *
- * Both the text and keywords are normalised to lower-case before comparison.
- * Each keyword that appears in the text contributes +1 to the score.
- */
-function keywordScore(text: string, keywords: string[]): number {
-  const lower = text.toLowerCase()
-  return keywords.reduce((acc, kw) => acc + (lower.includes(kw.toLowerCase()) ? 1 : 0), 0)
-}
-
-/**
- * Extract a list of meaningful keywords from a string for capability matching.
- *
- * Strips common stop-words so that incidental matches (e.g. "the", "and") do
- * not inflate scores. Returns unique words longer than three characters.
- */
-function extractKeywords(text: string): string[] {
-  const STOP_WORDS = new Set([
-    'the', 'and', 'for', 'that', 'this', 'with', 'are', 'from', 'have',
-    'will', 'your', 'you', 'can', 'all', 'each', 'when', 'then', 'they',
-    'them', 'their', 'about', 'into', 'more', 'also', 'should', 'must',
-  ])
-
-  return [...new Set(
-    text
-      .toLowerCase()
-      .split(/\W+/)
-      .filter((w) => w.length > 3 && !STOP_WORDS.has(w)),
-  )]
 }
 
 // ---------------------------------------------------------------------------
