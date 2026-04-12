@@ -4,12 +4,16 @@
   "description": "TypeScript multi-agent framework — one runTeam() call from goal to result. Auto task decomposition, parallel execution. 3 dependencies, deploys anywhere Node.js runs.",
   "files": [
     "dist",
+    "docs",
     "README.md",
     "LICENSE"
   ],
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "oma": "dist/cli/oma.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

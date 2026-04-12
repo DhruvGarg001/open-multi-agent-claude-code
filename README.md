@@ -75,6 +75,8 @@ Set the API key for your provider. Local models via Ollama require no API key â€
 - `XAI_API_KEY` (for Grok)
 - `GITHUB_TOKEN` (for Copilot)
 
+**CLI (`oma`).** For shell and CI, the package exposes a JSON-first binary. See [docs/cli.md](./docs/cli.md) for `oma run`, `oma task`, `oma provider`, exit codes, and file formats.
+
 Three agents, one goal â€” the framework handles the rest:
 
 ```typescript

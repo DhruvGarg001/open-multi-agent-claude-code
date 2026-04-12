@@ -10,9 +10,10 @@ npm run dev            # Watch mode compilation
 npm run lint           # Type-check only (tsc --noEmit)
 npm test               # Run all tests (vitest run)
 npm run test:watch     # Vitest watch mode
+node dist/cli/oma.js help   # After build: shell/CI CLI (`oma` when installed via npm bin)
 ```
 
-Tests live in `tests/` (vitest). Examples in `examples/` are standalone scripts requiring API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`).
+Tests live in `tests/` (vitest). Examples in `examples/` are standalone scripts requiring API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`). CLI usage and JSON schemas: `docs/cli.md`.
 
 ## Architecture
 
