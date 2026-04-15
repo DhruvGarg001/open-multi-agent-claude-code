@@ -44,6 +44,7 @@
 import type {
   AgentConfig,
   AgentRunResult,
+  CoordinatorConfig,
   OrchestratorConfig,
   OrchestratorEvent,
   Task,
@@ -63,6 +64,8 @@ import { Team } from '../team/team.js'
 import { TaskQueue } from '../task/queue.js'
 import { createTask } from '../task/task.js'
 import { Scheduler } from './scheduler.js'
+import { TokenBudgetExceededError } from '../errors.js'
+import { extractKeywords, keywordScore } from '../utils/keywords.js'
 
 // ---------------------------------------------------------------------------
 // Internal constants
@@ -71,6 +74,119 @@ import { Scheduler } from './scheduler.js'
 const ZERO_USAGE: TokenUsage = { input_tokens: 0, output_tokens: 0 }
 const DEFAULT_MAX_CONCURRENCY = 5
 const DEFAULT_MODEL = 'claude-opus-4-6'
+
+// ---------------------------------------------------------------------------
+// Short-circuit helpers (exported for testability)
+// ---------------------------------------------------------------------------
+
+/**
+ * Regex patterns that indicate a goal requires multi-agent coordination.
+ *
+ * Each pattern targets a distinct complexity signal:
+ * - Sequencing:     "first … then", "step 1 / step 2", numbered lists
+ * - Coordination:   "collaborate", "coordinate", "review each other"
+ * - Parallel work:  "in parallel", "at the same time", "concurrently"
+ * - Multi-phase:    "phase", "stage", multiple distinct action verbs joined by connectives
+ */
+const COMPLEXITY_PATTERNS: RegExp[] = [
+  // Explicit sequencing
+  /\bfirst\b.{3,60}\bthen\b/i,
+  /\bstep\s*\d/i,
+  /\bphase\s*\d/i,
+  /\bstage\s*\d/i,
+  /^\s*\d+[\.\)]/m,                       // numbered list items ("1. …", "2) …")
+
+  // Coordination language — must be an imperative directive aimed at the agents
+  // ("collaborate with X", "coordinate the team", "agents should coordinate"),
+  // not a descriptive use ("how does X coordinate with Y" / "what does collaboration mean").
+  // Match either an explicit preposition or a noun-phrase that names a group.
+  /\bcollaborat(?:e|ing)\b\s+(?:with|on|to)\b/i,
+  /\bcoordinat(?:e|ing)\b\s+(?:with|on|across|between|the\s+(?:team|agents?|workers?|effort|work))\b/i,
+  /\breview\s+each\s+other/i,
+  /\bwork\s+together\b/i,
+
+  // Parallel execution
+  /\bin\s+parallel\b/i,
+  /\bconcurrently\b/i,
+  /\bat\s+the\s+same\s+time\b/i,
+
+  // Multiple deliverables joined by connectives
+  // Matches patterns like "build X, then deploy Y and test Z"
+  /\b(?:build|create|implement|design|write|develop)\b.{5,80}\b(?:and|then)\b.{5,80}\b(?:build|create|implement|design|write|develop|test|review|deploy)\b/i,
+]
+
+
+/**
+ * Maximum goal length (in characters) below which a goal *may* be simple.
+ *
+ * Goals longer than this threshold almost always contain enough detail to
+ * warrant multi-agent decomposition. The value is generous — short-circuit
+ * is meant for genuinely simple, single-action goals.
+ */
+const SIMPLE_GOAL_MAX_LENGTH = 200
+
+/**
+ * Determine whether a goal is simple enough to skip coordinator decomposition.
+ *
+ * A goal is considered "simple" when ALL of the following hold:
+ *   1. Its length is ≤ {@link SIMPLE_GOAL_MAX_LENGTH}.
+ *   2. It does not match any {@link COMPLEXITY_PATTERNS}.
+ *
+ * The complexity patterns are deliberately conservative — they only fire on
+ * imperative coordination directives (e.g. "collaborate with the team",
+ * "coordinate the workers"), so descriptive uses ("how do pods coordinate
+ * state", "explain microservice collaboration") remain classified as simple.
+ *
+ * Exported for unit testing.
+ */
+export function isSimpleGoal(goal: string): boolean {
+  if (goal.length > SIMPLE_GOAL_MAX_LENGTH) return false
+  return !COMPLEXITY_PATTERNS.some((re) => re.test(goal))
+}
+
+/**
+ * Select the best-matching agent for a goal using keyword affinity scoring.
+ *
+ * The scoring logic mirrors {@link Scheduler}'s `capability-match` strategy
+ * exactly, including its asymmetric use of the agent's `model` field:
+ *
+ *  - `agentKeywords` is computed from `name + systemPrompt + model` so that
+ *    a goal which mentions a model name (e.g. "haiku") can boost an agent
+ *    bound to that model.
+ *  - `agentText` (used for the reverse direction) is computed from
+ *    `name + systemPrompt` only — model names should not bias the
+ *    text-vs-goal-keywords match.
+ *
+ * The two-direction sum (`scoreA + scoreB`) ensures both "agent describes
+ * goal" and "goal mentions agent capability" contribute to the final score.
+ *
+ * Exported for unit testing.
+ */
+export function selectBestAgent(goal: string, agents: AgentConfig[]): AgentConfig {
+  if (agents.length <= 1) return agents[0]!
+
+  const goalKeywords = extractKeywords(goal)
+
+  let bestAgent = agents[0]!
+  let bestScore = -1
+
+  for (const agent of agents) {
+    const agentText = `${agent.name} ${agent.systemPrompt ?? ''}`
+    // Mirror Scheduler.capability-match: include `model` here only.
+    const agentKeywords = extractKeywords(`${agent.name} ${agent.systemPrompt ?? ''} ${agent.model}`)
+
+    const scoreA = keywordScore(agentText, goalKeywords)
+    const scoreB = keywordScore(goal, agentKeywords)
+    const score = scoreA + scoreB
+
+    if (score > bestScore) {
+      bestScore = score
+      bestAgent = agent
+    }
+  }
+
+  return bestAgent
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -83,6 +199,12 @@ function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
   }
 }
 
+function resolveTokenBudget(primary?: number, fallback?: number): number | undefined {
+  if (primary === undefined) return fallback
+  if (fallback === undefined) return primary
+  return Math.min(primary, fallback)
+}
+
 /**
  * Build a minimal {@link Agent} with its own fresh registry/executor.
  * Registers all built-in tools so coordinator/worker agents can use them.
@@ -90,6 +212,11 @@ function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
 function buildAgent(config: AgentConfig): Agent {
   const registry = new ToolRegistry()
   registerBuiltInTools(registry)
+  if (config.customTools) {
+    for (const tool of config.customTools) {
+      registry.register(tool, { runtimeAdded: true })
+    }
+  }
   const executor = new ToolExecutor(registry)
   return new Agent(config, registry, executor)
 }
@@ -202,6 +329,10 @@ interface ParsedTaskSpec {
   description: string
   assignee?: string
   dependsOn?: string[]
+  memoryScope?: 'dependencies' | 'all'
+  maxRetries?: number
+  retryDelayMs?: number
+  retryBackoff?: number
 }
 
 /**
@@ -240,6 +371,10 @@ function parseTaskSpecs(raw: string): ParsedTaskSpec[] | null {
         dependsOn: Array.isArray(obj['dependsOn'])
           ? (obj['dependsOn'] as unknown[]).filter((x): x is string => typeof x === 'string')
           : undefined,
+        memoryScope: obj['memoryScope'] === 'all' ? 'all' : undefined,
+        maxRetries: typeof obj['maxRetries'] === 'number' ? obj['maxRetries'] : undefined,
+        retryDelayMs: typeof obj['retryDelayMs'] === 'number' ? obj['retryDelayMs'] : undefined,
+        retryBackoff: typeof obj['retryBackoff'] === 'number' ? obj['retryBackoff'] : undefined,
       })
     }
 
@@ -264,6 +399,12 @@ interface RunContext {
   readonly config: OrchestratorConfig
   /** Trace run ID, present when `onTrace` is configured. */
   readonly runId?: string
+  /** AbortSignal for run-level cancellation. Checked between task dispatch rounds. */
+  readonly abortSignal?: AbortSignal
+  cumulativeUsage: TokenUsage
+  readonly maxTokenBudget?: number
+  budgetExceededTriggered: boolean
+  budgetExceededReason?: string
 }
 
 /**
@@ -283,7 +424,24 @@ async function executeQueue(
 ): Promise<void> {
   const { team, pool, scheduler, config } = ctx
 
+  // Relay queue-level skip events to the orchestrator's onProgress callback.
+  const unsubSkipped = config.onProgress
+    ? queue.on('task:skipped', (task) => {
+        config.onProgress!({
+          type: 'task_skipped',
+          task: task.id,
+          data: task,
+        } satisfies OrchestratorEvent)
+      })
+    : undefined
+
   while (true) {
+    // Check for cancellation before each dispatch round.
+    if (ctx.abortSignal?.aborted) {
+      queue.skipRemaining('Skipped: run aborted.')
+      break
+    }
+
     // Re-run auto-assignment each iteration so tasks that were unblocked since
     // the last round (and thus have no assignee yet) get assigned before dispatch.
     scheduler.autoAssign(queue, team.getAgents())
@@ -293,6 +451,11 @@ async function executeQueue(
       // Either all done, or everything remaining is blocked/failed.
       break
     }
+
+    // Track tasks that complete successfully in this round for the approval gate.
+    // Safe to push from concurrent promises: JS is single-threaded, so
+    // Array.push calls from resolved microtasks never interleave.
+    const completedThisRound: Task[] = []
 
     // Dispatch all currently-pending tasks as a parallel batch.
     const dispatchPromises = pending.map(async (task): Promise<void> => {
@@ -339,13 +502,13 @@ async function executeQueue(
         data: task,
       } satisfies OrchestratorEvent)
 
-      // Build the prompt: inject shared memory context + task description
-      const prompt = await buildTaskPrompt(task, team)
+      // Build the prompt: task description + dependency-only context by default.
+      const prompt = await buildTaskPrompt(task, team, queue)
 
       // Build trace context for this task's agent run
       const traceOptions: Partial<RunOptions> | undefined = config.onTrace
-        ? { onTrace: config.onTrace, runId: ctx.runId ?? '', taskId: task.id, traceAgent: assignee }
-        : undefined
+        ? { onTrace: config.onTrace, runId: ctx.runId ?? '', taskId: task.id, traceAgent: assignee, abortSignal: ctx.abortSignal }
+        : ctx.abortSignal ? { abortSignal: ctx.abortSignal } : undefined
 
       const taskStartMs = config.onTrace ? Date.now() : 0
       let retryCount = 0
@@ -382,6 +545,23 @@ async function executeQueue(
       }
 
       ctx.agentResults.set(`${assignee}:${task.id}`, result)
+      ctx.cumulativeUsage = addUsage(ctx.cumulativeUsage, result.tokenUsage)
+      const totalTokens = ctx.cumulativeUsage.input_tokens + ctx.cumulativeUsage.output_tokens
+      if (
+        !ctx.budgetExceededTriggered
+        && ctx.maxTokenBudget !== undefined
+        && totalTokens > ctx.maxTokenBudget
+      ) {
+        ctx.budgetExceededTriggered = true
+        const err = new TokenBudgetExceededError('orchestrator', totalTokens, ctx.maxTokenBudget)
+        ctx.budgetExceededReason = err.message
+        config.onProgress?.({
+          type: 'budget_exceeded',
+          agent: assignee,
+          task: task.id,
+          data: err,
+        } satisfies OrchestratorEvent)
+      }
 
       if (result.success) {
         // Persist result into shared memory so other agents can read it
@@ -390,7 +570,8 @@ async function executeQueue(
           await sharedMem.write(assignee, `task:${task.id}:result`, result.output)
         }
 
-        queue.complete(task.id, result.output)
+        const completedTask = queue.complete(task.id, result.output)
+        completedThisRound.push(completedTask)
 
         config.onProgress?.({
           type: 'task_complete',
@@ -418,7 +599,36 @@ async function executeQueue(
 
     // Wait for the entire parallel batch before checking for newly-unblocked tasks.
     await Promise.all(dispatchPromises)
+    if (ctx.budgetExceededTriggered) {
+      queue.skipRemaining(ctx.budgetExceededReason ?? 'Skipped: token budget exceeded.')
+      break
+    }
+
+    // --- Approval gate ---
+    // After the batch completes, check if the caller wants to approve
+    // the next round before it starts.
+    if (config.onApproval && completedThisRound.length > 0) {
+      scheduler.autoAssign(queue, team.getAgents())
+      const nextPending = queue.getByStatus('pending')
+
+      if (nextPending.length > 0) {
+        let approved: boolean
+        try {
+          approved = await config.onApproval(completedThisRound, nextPending)
+        } catch (err) {
+          const reason = `Skipped: approval callback error — ${err instanceof Error ? err.message : String(err)}`
+          queue.skipRemaining(reason)
+          break
+        }
+        if (!approved) {
+          queue.skipRemaining('Skipped: approval rejected.')
+          break
+        }
+      }
+    }
   }
+
+  unsubSkipped?.()
 }
 
 /**
@@ -426,22 +636,37 @@ async function executeQueue(
  *
  * Injects:
  *  - Task title and description
- *  - Dependency results from shared memory (if available)
+ *  - Direct dependency task results by default (clean slate when none)
+ *  - Optional full shared-memory context when `task.memoryScope === 'all'`
  *  - Any messages addressed to this agent from the team bus
  */
-async function buildTaskPrompt(task: Task, team: Team): Promise<string> {
+async function buildTaskPrompt(task: Task, team: Team, queue: TaskQueue): Promise<string> {
   const lines: string[] = [
     `# Task: ${task.title}`,
     '',
     task.description,
   ]
 
-  // Inject shared memory summary so the agent sees its teammates' work
-  const sharedMem = team.getSharedMemoryInstance()
-  if (sharedMem) {
-    const summary = await sharedMem.getSummary()
-    if (summary) {
-      lines.push('', summary)
+  if (task.memoryScope === 'all') {
+    // Explicit opt-in for full visibility (legacy/shared-memory behavior).
+    const sharedMem = team.getSharedMemoryInstance()
+    if (sharedMem) {
+      const summary = await sharedMem.getSummary()
+      if (summary) {
+        lines.push('', summary)
+      }
+    }
+  } else if (task.dependsOn && task.dependsOn.length > 0) {
+    // Default-deny: inject only explicit prerequisite outputs.
+    const depResults: string[] = []
+    for (const depId of task.dependsOn) {
+      const depTask = queue.get(depId)
+      if (depTask?.status === 'completed' && depTask.result) {
+        depResults.push(`### ${depTask.title} (by ${depTask.assignee ?? 'unknown'})\n${depTask.result}`)
+      }
+    }
+    if (depResults.length > 0) {
+      lines.push('', '## Context from prerequisite tasks', '', ...depResults)
     }
   }
 
@@ -471,8 +696,8 @@ async function buildTaskPrompt(task: Task, team: Team): Promise<string> {
  */
 export class OpenMultiAgent {
   private readonly config: Required<
-    Omit<OrchestratorConfig, 'onProgress' | 'onTrace' | 'defaultBaseURL' | 'defaultApiKey'>
-  > & Pick<OrchestratorConfig, 'onProgress' | 'onTrace' | 'defaultBaseURL' | 'defaultApiKey'>
+    Omit<OrchestratorConfig, 'onApproval' | 'onProgress' | 'onTrace' | 'defaultBaseURL' | 'defaultApiKey' | 'maxTokenBudget'>
+  > & Pick<OrchestratorConfig, 'onApproval' | 'onProgress' | 'onTrace' | 'defaultBaseURL' | 'defaultApiKey' | 'maxTokenBudget'>
 
   private readonly teams: Map<string, Team> = new Map()
   private completedTaskCount = 0
@@ -492,6 +717,8 @@ export class OpenMultiAgent {
       defaultProvider: config.defaultProvider ?? 'anthropic',
       defaultBaseURL: config.defaultBaseURL,
       defaultApiKey: config.defaultApiKey,
+      maxTokenBudget: config.maxTokenBudget,
+      onApproval: config.onApproval,
       onProgress: config.onProgress,
       onTrace: config.onTrace,
     }
@@ -537,12 +764,18 @@ export class OpenMultiAgent {
    * @param config - Agent configuration.
    * @param prompt - The user prompt to send.
    */
-  async runAgent(config: AgentConfig, prompt: string): Promise<AgentRunResult> {
+  async runAgent(
+    config: AgentConfig,
+    prompt: string,
+    options?: { abortSignal?: AbortSignal },
+  ): Promise<AgentRunResult> {
+    const effectiveBudget = resolveTokenBudget(config.maxTokenBudget, this.config.maxTokenBudget)
     const effective: AgentConfig = {
       ...config,
       provider: config.provider ?? this.config.defaultProvider,
       baseURL: config.baseURL ?? this.config.defaultBaseURL,
       apiKey: config.apiKey ?? this.config.defaultApiKey,
+      maxTokenBudget: effectiveBudget,
     }
     const agent = buildAgent(effective)
     this.config.onProgress?.({
@@ -551,11 +784,34 @@ export class OpenMultiAgent {
       data: { prompt },
     })
 
-    const traceOptions: Partial<RunOptions> | undefined = this.config.onTrace
-      ? { onTrace: this.config.onTrace, runId: generateRunId(), traceAgent: config.name }
-      : undefined
+    // Build run-time options: trace + optional abort signal. RunOptions has
+    // readonly fields, so we assemble the literal in one shot.
+    const traceFields = this.config.onTrace
+      ? {
+          onTrace: this.config.onTrace,
+          runId: generateRunId(),
+          traceAgent: config.name,
+        }
+      : null
+    const abortFields = options?.abortSignal ? { abortSignal: options.abortSignal } : null
+    const runOptions: Partial<RunOptions> | undefined =
+      traceFields || abortFields
+        ? { ...(traceFields ?? {}), ...(abortFields ?? {}) }
+        : undefined
 
-    const result = await agent.run(prompt, traceOptions)
+    const result = await agent.run(prompt, runOptions)
+
+    if (result.budgetExceeded) {
+      this.config.onProgress?.({
+        type: 'budget_exceeded',
+        agent: config.name,
+        data: new TokenBudgetExceededError(
+          config.name,
+          result.tokenUsage.input_tokens + result.tokenUsage.output_tokens,
+          effectiveBudget ?? 0,
+        ),
+      })
+    }
 
     this.config.onProgress?.({
       type: 'agent_complete',
@@ -595,20 +851,98 @@ export class OpenMultiAgent {
    * @param team - A team created via {@link createTeam} (or `new Team(...)`).
    * @param goal - High-level natural-language goal for the team.
    */
-  async runTeam(team: Team, goal: string): Promise<TeamRunResult> {
+  async runTeam(
+    team: Team,
+    goal: string,
+    options?: { abortSignal?: AbortSignal; coordinator?: CoordinatorConfig },
+  ): Promise<TeamRunResult> {
     const agentConfigs = team.getAgents()
+    const coordinatorOverrides = options?.coordinator
+
+    // ------------------------------------------------------------------
+    // Short-circuit: skip coordinator for simple, single-action goals.
+    //
+    // When the goal is short and contains no multi-step / coordination
+    // signals, dispatching it to a single agent is faster and cheaper
+    // than spinning up a coordinator for decomposition + synthesis.
+    //
+    // The best-matching agent is selected via keyword affinity scoring
+    // (same algorithm as the `capability-match` scheduler strategy).
+    // ------------------------------------------------------------------
+    if (agentConfigs.length > 0 && isSimpleGoal(goal)) {
+      const bestAgent = selectBestAgent(goal, agentConfigs)
+
+      // Use buildAgent() + agent.run() directly instead of this.runAgent()
+      // to avoid duplicate progress events and double completedTaskCount.
+      // Events are emitted here; counting is handled by buildTeamRunResult().
+      const effectiveBudget = resolveTokenBudget(bestAgent.maxTokenBudget, this.config.maxTokenBudget)
+      const effective: AgentConfig = {
+        ...bestAgent,
+        provider: bestAgent.provider ?? this.config.defaultProvider,
+        baseURL: bestAgent.baseURL ?? this.config.defaultBaseURL,
+        apiKey: bestAgent.apiKey ?? this.config.defaultApiKey,
+        maxTokenBudget: effectiveBudget,
+      }
+      const agent = buildAgent(effective)
+
+      this.config.onProgress?.({
+        type: 'agent_start',
+        agent: bestAgent.name,
+        data: { phase: 'short-circuit', goal },
+      })
+
+      const traceFields = this.config.onTrace
+        ? { onTrace: this.config.onTrace, runId: generateRunId(), traceAgent: bestAgent.name }
+        : null
+      const abortFields = options?.abortSignal ? { abortSignal: options.abortSignal } : null
+      const runOptions: Partial<RunOptions> | undefined =
+        traceFields || abortFields
+          ? { ...(traceFields ?? {}), ...(abortFields ?? {}) }
+          : undefined
+
+      const result = await agent.run(goal, runOptions)
+
+      if (result.budgetExceeded) {
+        this.config.onProgress?.({
+          type: 'budget_exceeded',
+          agent: bestAgent.name,
+          data: new TokenBudgetExceededError(
+            bestAgent.name,
+            result.tokenUsage.input_tokens + result.tokenUsage.output_tokens,
+            effectiveBudget ?? 0,
+          ),
+        })
+      }
+
+      this.config.onProgress?.({
+        type: 'agent_complete',
+        agent: bestAgent.name,
+        data: { phase: 'short-circuit', result },
+      })
+
+      const agentResults = new Map<string, AgentRunResult>()
+      agentResults.set(bestAgent.name, result)
+      return this.buildTeamRunResult(agentResults)
+    }
 
     // ------------------------------------------------------------------
     // Step 1: Coordinator decomposes goal into tasks
     // ------------------------------------------------------------------
     const coordinatorConfig: AgentConfig = {
       name: 'coordinator',
-      model: this.config.defaultModel,
-      provider: this.config.defaultProvider,
-      baseURL: this.config.defaultBaseURL,
-      apiKey: this.config.defaultApiKey,
-      systemPrompt: this.buildCoordinatorSystemPrompt(agentConfigs),
-      maxTurns: 3,
+      model: coordinatorOverrides?.model ?? this.config.defaultModel,
+      provider: coordinatorOverrides?.provider ?? this.config.defaultProvider,
+      baseURL: coordinatorOverrides?.baseURL ?? this.config.defaultBaseURL,
+      apiKey: coordinatorOverrides?.apiKey ?? this.config.defaultApiKey,
+      systemPrompt: this.buildCoordinatorPrompt(agentConfigs, coordinatorOverrides),
+      maxTurns: coordinatorOverrides?.maxTurns ?? 3,
+      maxTokens: coordinatorOverrides?.maxTokens,
+      temperature: coordinatorOverrides?.temperature,
+      toolPreset: coordinatorOverrides?.toolPreset,
+      tools: coordinatorOverrides?.tools,
+      disallowedTools: coordinatorOverrides?.disallowedTools,
+      loopDetection: coordinatorOverrides?.loopDetection,
+      timeoutMs: coordinatorOverrides?.timeoutMs,
     }
 
     const decompositionPrompt = this.buildDecompositionPrompt(goal, agentConfigs)
@@ -622,11 +956,29 @@ export class OpenMultiAgent {
     })
 
     const decompTraceOptions: Partial<RunOptions> | undefined = this.config.onTrace
-      ? { onTrace: this.config.onTrace, runId: runId ?? '', traceAgent: 'coordinator' }
-      : undefined
+      ? { onTrace: this.config.onTrace, runId: runId ?? '', traceAgent: 'coordinator', abortSignal: options?.abortSignal }
+      : options?.abortSignal ? { abortSignal: options.abortSignal } : undefined
     const decompositionResult = await coordinatorAgent.run(decompositionPrompt, decompTraceOptions)
     const agentResults = new Map<string, AgentRunResult>()
     agentResults.set('coordinator:decompose', decompositionResult)
+    const maxTokenBudget = this.config.maxTokenBudget
+    let cumulativeUsage = addUsage(ZERO_USAGE, decompositionResult.tokenUsage)
+
+    if (
+      maxTokenBudget !== undefined
+      && cumulativeUsage.input_tokens + cumulativeUsage.output_tokens > maxTokenBudget
+    ) {
+      this.config.onProgress?.({
+        type: 'budget_exceeded',
+        agent: 'coordinator',
+        data: new TokenBudgetExceededError(
+          'coordinator',
+          cumulativeUsage.input_tokens + cumulativeUsage.output_tokens,
+          maxTokenBudget,
+        ),
+      })
+      return this.buildTeamRunResult(agentResults)
+    }
 
     // ------------------------------------------------------------------
     // Step 2: Parse tasks from coordinator output
@@ -669,19 +1021,46 @@ export class OpenMultiAgent {
       agentResults,
       config: this.config,
       runId,
+      abortSignal: options?.abortSignal,
+      cumulativeUsage,
+      maxTokenBudget,
+      budgetExceededTriggered: false,
+      budgetExceededReason: undefined,
     }
 
     await executeQueue(queue, ctx)
+    cumulativeUsage = ctx.cumulativeUsage
 
     // ------------------------------------------------------------------
     // Step 5: Coordinator synthesises final result
     // ------------------------------------------------------------------
+    if (
+      maxTokenBudget !== undefined
+      && cumulativeUsage.input_tokens + cumulativeUsage.output_tokens > maxTokenBudget
+    ) {
+      return this.buildTeamRunResult(agentResults)
+    }
     const synthesisPrompt = await this.buildSynthesisPrompt(goal, queue.list(), team)
     const synthTraceOptions: Partial<RunOptions> | undefined = this.config.onTrace
       ? { onTrace: this.config.onTrace, runId: runId ?? '', traceAgent: 'coordinator' }
       : undefined
     const synthesisResult = await coordinatorAgent.run(synthesisPrompt, synthTraceOptions)
     agentResults.set('coordinator', synthesisResult)
+    cumulativeUsage = addUsage(cumulativeUsage, synthesisResult.tokenUsage)
+    if (
+      maxTokenBudget !== undefined
+      && cumulativeUsage.input_tokens + cumulativeUsage.output_tokens > maxTokenBudget
+    ) {
+      this.config.onProgress?.({
+        type: 'budget_exceeded',
+        agent: 'coordinator',
+        data: new TokenBudgetExceededError(
+          'coordinator',
+          cumulativeUsage.input_tokens + cumulativeUsage.output_tokens,
+          maxTokenBudget,
+        ),
+      })
+    }
 
     this.config.onProgress?.({
       type: 'agent_complete',
@@ -717,10 +1096,12 @@ export class OpenMultiAgent {
       description: string
       assignee?: string
       dependsOn?: string[]
+      memoryScope?: 'dependencies' | 'all'
       maxRetries?: number
       retryDelayMs?: number
       retryBackoff?: number
     }>,
+    options?: { abortSignal?: AbortSignal },
   ): Promise<TeamRunResult> {
     const agentConfigs = team.getAgents()
     const queue = new TaskQueue()
@@ -732,6 +1113,7 @@ export class OpenMultiAgent {
         description: t.description,
         assignee: t.assignee,
         dependsOn: t.dependsOn,
+        memoryScope: t.memoryScope,
         maxRetries: t.maxRetries,
         retryDelayMs: t.retryDelayMs,
         retryBackoff: t.retryBackoff,
@@ -751,6 +1133,11 @@ export class OpenMultiAgent {
       agentResults,
       config: this.config,
       runId: this.config.onTrace ? generateRunId() : undefined,
+      abortSignal: options?.abortSignal,
+      cumulativeUsage: ZERO_USAGE,
+      maxTokenBudget: this.config.maxTokenBudget,
+      budgetExceededTriggered: false,
+      budgetExceededReason: undefined,
     }
 
     await executeQueue(queue, ctx)
@@ -802,6 +1189,47 @@ export class OpenMultiAgent {
 
   /** Build the system prompt given to the coordinator agent. */
   private buildCoordinatorSystemPrompt(agents: AgentConfig[]): string {
+    return [
+      'You are a task coordinator responsible for decomposing high-level goals',
+      'into concrete, actionable tasks and assigning them to the right team members.',
+      '',
+      this.buildCoordinatorRosterSection(agents),
+      '',
+      this.buildCoordinatorOutputFormatSection(),
+      '',
+      this.buildCoordinatorSynthesisSection(),
+    ].join('\n')
+  }
+
+  /** Build coordinator system prompt with optional caller overrides. */
+  private buildCoordinatorPrompt(agents: AgentConfig[], config?: CoordinatorConfig): string {
+    if (config?.systemPrompt) {
+      return [
+        config.systemPrompt,
+        '',
+        this.buildCoordinatorRosterSection(agents),
+        '',
+        this.buildCoordinatorOutputFormatSection(),
+        '',
+        this.buildCoordinatorSynthesisSection(),
+      ].join('\n')
+    }
+
+    const base = this.buildCoordinatorSystemPrompt(agents)
+    if (!config?.instructions) {
+      return base
+    }
+
+    return [
+      base,
+      '',
+      '## Additional Instructions',
+      config.instructions,
+    ].join('\n')
+  }
+
+  /** Build the coordinator team roster section. */
+  private buildCoordinatorRosterSection(agents: AgentConfig[]): string {
     const roster = agents
       .map(
         (a) =>
@@ -810,12 +1238,14 @@ export class OpenMultiAgent {
       .join('\n')
 
     return [
-      'You are a task coordinator responsible for decomposing high-level goals',
-      'into concrete, actionable tasks and assigning them to the right team members.',
-      '',
       '## Team Roster',
       roster,
-      '',
+    ].join('\n')
+  }
+
+  /** Build the coordinator JSON output-format section. */
+  private buildCoordinatorOutputFormatSection(): string {
+    return [
       '## Output Format',
       'When asked to decompose a goal, respond ONLY with a JSON array of task objects.',
       'Each task must have:',
@@ -826,7 +1256,12 @@ export class OpenMultiAgent {
       '',
       'Wrap the JSON in a ```json code fence.',
       'Do not include any text outside the code fence.',
-      '',
+    ].join('\n')
+  }
+
+  /** Build the coordinator synthesis guidance section. */
+  private buildCoordinatorSynthesisSection(): string {
+    return [
       '## When synthesising results',
       'You will be given completed task outputs and asked to synthesise a final answer.',
       'Write a clear, comprehensive response that addresses the original goal.',
@@ -854,6 +1289,7 @@ export class OpenMultiAgent {
   ): Promise<string> {
     const completedTasks = tasks.filter((t) => t.status === 'completed')
     const failedTasks = tasks.filter((t) => t.status === 'failed')
+    const skippedTasks = tasks.filter((t) => t.status === 'skipped')
 
     const resultSections = completedTasks.map((t) => {
       const assignee = t.assignee ?? 'unknown'
@@ -862,6 +1298,10 @@ export class OpenMultiAgent {
 
     const failureSections = failedTasks.map(
       (t) => `### ${t.title} (FAILED)\nError: ${t.result ?? 'unknown error'}`,
+    )
+
+    const skippedSections = skippedTasks.map(
+      (t) => `### ${t.title} (SKIPPED)\nReason: ${t.result ?? 'approval rejected'}`,
     )
 
     // Also include shared memory summary for additional context
@@ -878,11 +1318,12 @@ export class OpenMultiAgent {
       `## Task Results`,
       ...resultSections,
       ...(failureSections.length > 0 ? ['', '## Failed Tasks', ...failureSections] : []),
+      ...(skippedSections.length > 0 ? ['', '## Skipped Tasks', ...skippedSections] : []),
       ...(memorySummary ? ['', memorySummary] : []),
       '',
       '## Your Task',
       'Synthesise the above results into a comprehensive final answer that addresses the original goal.',
-      'If some tasks failed, note any gaps in the result.',
+      'If some tasks failed or were skipped, note any gaps in the result.',
     ].join('\n')
   }
 
@@ -894,6 +1335,7 @@ export class OpenMultiAgent {
    */
   private loadSpecsIntoQueue(
     specs: ReadonlyArray<ParsedTaskSpec & {
+      memoryScope?: 'dependencies' | 'all'
       maxRetries?: number
       retryDelayMs?: number
       retryBackoff?: number
@@ -914,6 +1356,7 @@ export class OpenMultiAgent {
         assignee: spec.assignee && agentNames.has(spec.assignee)
           ? spec.assignee
           : undefined,
+        memoryScope: spec.memoryScope,
         maxRetries: spec.maxRetries,
         retryDelayMs: spec.retryDelayMs,
         retryBackoff: spec.retryBackoff,

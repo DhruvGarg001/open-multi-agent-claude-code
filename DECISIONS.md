@@ -1,10 +1,10 @@
 # Architecture Decisions
 
-This document records deliberate "won't do" decisions for the project. These are features we evaluated and chose NOT to implement — not because they're bad ideas, but because they conflict with our positioning as the **simplest multi-agent framework**.
-
-If you're considering a PR in any of these areas, please open a discussion first.
+This document records our architectural decisions — both what we choose NOT to build, and what we're actively working toward. Our goal is to be the **simplest multi-agent framework**, but simplicity doesn't mean closed. We believe the long-term value of a framework isn't its feature checklist — it's the size of the network it connects to.
 
 ## Won't Do
+
+These are paradigms we evaluated and deliberately chose not to implement, because they conflict with our core model.
 
 ### 1. Agent Handoffs
 
@@ -20,24 +20,30 @@ If you're considering a PR in any of these areas, please open a discussion first
 
 **Related**: Closing #20 with this rationale.
 
-### 3. A2A Protocol (Agent-to-Agent)
+## Open to Adoption
 
-**What**: Google's open protocol for agents on different servers to discover and communicate with each other.
+These are protocols we see strategic value in and are actively tracking. We're waiting for the right moment — not the right feature spec, but the right network density.
 
-**Why not**: Too early — the spec is still evolving and adoption is minimal. Our users run agents in a single process, not across distributed services. If A2A matures and there's real demand, we can revisit. Today it would add complexity for zero practical benefit.
+> **Our thesis**: Framework competition on features (DAG scheduling, shared memory, zero-dependency) is a race that can always be caught. Network competition — where the value of the framework grows with every agent published to it — creates a fundamentally different moat. MCP and A2A are the protocols that turn a framework from a build tool into a registry.
 
-### 4. MCP Integration (Model Context Protocol)
+### 3. MCP Integration (Model Context Protocol)
 
 **What**: Anthropic's protocol for connecting LLMs to external tools and data sources.
 
-**Why not**: MCP is valuable but targets a different layer. Our `defineTool()` API already lets users wrap any external service as a tool in ~10 lines of code. Adding MCP would mean maintaining protocol compatibility, transport layers, and tool discovery — complexity that serves tool platform builders, not our target users who just want to run agent teams.
+**Status**: **Next up.** MCP has crossed the adoption threshold — Cursor, Windsurf, Claude Code all ship with built-in support, and many services now provide MCP servers directly. Asking users to re-wrap each one via `defineTool()` creates unnecessary friction.
 
-### 5. Dashboard / Visualization
+**Approach**: Optional peer dependency (`@modelcontextprotocol/sdk`). Zero impact on the core — if you don't use MCP, you don't pay for it. This preserves our minimal-dependency principle while connecting to the broader tool ecosystem.
 
-**What**: Built-in web UI to visualize task DAGs, agent activity, and token usage.
+**Tracking**: #86
 
-**Why not**: We expose data, we don't build UI. The `onProgress` callback and upcoming `onTrace` (#18) give users all the raw data. They can pipe it into Grafana, build a custom dashboard, or use console logs. Shipping a web UI means owning a frontend stack, which is outside our scope.
+### 4. A2A Protocol (Agent-to-Agent)
+
+**What**: Google's open protocol for agents on different servers to discover and communicate with each other.
+
+**Status**: **Watching.** The spec is still evolving and production adoption is minimal. But we recognize A2A's potential to enable the network effect we care about — if 1,000 developers publish agent services using open-multi-agent, the 1,001st developer isn't just choosing an API, they're choosing which ecosystem has the most agents they can call.
+
+**When we'll move**: When A2A adoption reaches a tipping point where the protocol connects real, production agent services — not just demos. We'll prioritize a lightweight integration that lets agents be both consumers and providers of A2A services.
 
 ---
 
-*Last updated: 2026-04-03*
+*Last updated: 2026-04-09*

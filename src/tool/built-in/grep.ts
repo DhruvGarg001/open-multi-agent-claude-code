@@ -8,28 +8,18 @@
  */
 
 import { spawn } from 'child_process'
-import { readdir, readFile, stat } from 'fs/promises'
-// Note: readdir is used with { encoding: 'utf8' } to return string[] directly.
-import { join, relative } from 'path'
+import { readFile, stat } from 'fs/promises'
+import { relative } from 'path'
 import { z } from 'zod'
 import type { ToolResult } from '../../types.js'
 import { defineTool } from '../framework.js'
+import { collectFiles } from './fs-walk.js'
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAX_RESULTS = 100
-// Directories that are almost never useful to search inside
-const SKIP_DIRS = new Set([
-  '.git',
-  '.svn',
-  '.hg',
-  'node_modules',
-  '.next',
-  'dist',
-  'build',
-])
 
 // ---------------------------------------------------------------------------
 // Tool definition
@@ -42,6 +32,7 @@ export const grepTool = defineTool({
     'Returns matching lines with their file paths and 1-based line numbers. ' +
     'Use the `glob` parameter to restrict the search to specific file types ' +
     '(e.g. "*.ts"). ' +
+    'To list matching file paths without reading contents, use the `glob` tool. ' +
     'Results are capped by `maxResults` to keep the response manageable.',
 
   inputSchema: z.object({
@@ -268,79 +259,6 @@ async function runNodeSearch(
     data: formatted + truncationNote,
     isError: false,
   }
-}
-
-// ---------------------------------------------------------------------------
-// File collection with glob filtering
-// ---------------------------------------------------------------------------
-
-/**
- * Recursively walk `dir` and return file paths, honouring `SKIP_DIRS` and an
- * optional glob pattern.
- */
-async function collectFiles(
-  dir: string,
-  glob: string | undefined,
-  signal: AbortSignal | undefined,
-): Promise<string[]> {
-  const results: string[] = []
-  await walk(dir, glob, results, signal)
-  return results
-}
-
-async function walk(
-  dir: string,
-  glob: string | undefined,
-  results: string[],
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  if (signal?.aborted === true) return
-
-  let entryNames: string[]
-  try {
-    // Read as plain strings so we don't have to deal with Buffer Dirent variants.
-    entryNames = await readdir(dir, { encoding: 'utf8' })
-  } catch {
-    return
-  }
-
-  for (const entryName of entryNames) {
-    if (signal !== undefined && signal.aborted) return
-
-    const fullPath = join(dir, entryName)
-
-    let entryInfo: Awaited<ReturnType<typeof stat>>
-    try {
-      entryInfo = await stat(fullPath)
-    } catch {
-      continue
-    }
-
-    if (entryInfo.isDirectory()) {
-      if (!SKIP_DIRS.has(entryName)) {
-        await walk(fullPath, glob, results, signal)
-      }
-    } else if (entryInfo.isFile()) {
-      if (glob === undefined || matchesGlob(entryName, glob)) {
-        results.push(fullPath)
-      }
-    }
-  }
-}
-
-/**
- * Minimal glob match supporting `*.ext` and `**\/<pattern>` forms.
- */
-function matchesGlob(filename: string, glob: string): boolean {
-  // Strip leading **/ prefix — we already recurse into all directories
-  const pattern = glob.startsWith('**/') ? glob.slice(3) : glob
-  // Convert shell glob characters to regex equivalents
-  const regexSource = pattern
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&') // escape special regex chars first
-    .replace(/\*/g, '.*')                  // * -> .*
-    .replace(/\?/g, '.')                   // ? -> .
-  const re = new RegExp(`^${regexSource}$`, 'i')
-  return re.test(filename)
 }
 
 // ---------------------------------------------------------------------------

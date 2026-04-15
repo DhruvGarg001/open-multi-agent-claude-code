@@ -10,9 +10,10 @@ npm run dev            # Watch mode compilation
 npm run lint           # Type-check only (tsc --noEmit)
 npm test               # Run all tests (vitest run)
 npm run test:watch     # Vitest watch mode
+node dist/cli/oma.js help   # After build: shell/CI CLI (`oma` when installed via npm bin)
 ```
 
-Tests live in `tests/` (vitest). Examples in `examples/` are standalone scripts requiring API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`).
+Tests live in `tests/` (vitest). Examples in `examples/` are standalone scripts requiring API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`). CLI usage and JSON schemas: `docs/cli.md`.
 
 ## Architecture
 
@@ -55,7 +56,7 @@ This is the framework's key feature. When `runTeam()` is called:
 
 ### Concurrency Control
 
-Two independent semaphores: `AgentPool` (max concurrent agent runs, default 5) and `ToolExecutor` (max concurrent tool calls, default 4).
+Three semaphore layers: `AgentPool` pool-level (max concurrent agent runs, default 5), `AgentPool` per-agent mutex (serializes concurrent runs on the same `Agent` instance), and `ToolExecutor` (max concurrent tool calls, default 4).
 
 ### Structured Output
 

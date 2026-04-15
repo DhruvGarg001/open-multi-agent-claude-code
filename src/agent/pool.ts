@@ -58,6 +58,14 @@ export interface PoolStatus {
 export class AgentPool {
   private readonly agents: Map<string, Agent> = new Map()
   private readonly semaphore: Semaphore
+  /**
+   * Per-agent mutex (Semaphore(1)) to serialize concurrent runs on the same
+   * Agent instance.  Without this, two tasks assigned to the same agent could
+   * race on mutable instance state (`status`, `messages`, `tokenUsage`).
+   *
+   * @see https://github.com/anthropics/open-multi-agent/issues/72
+   */
+  private readonly agentLocks: Map<string, Semaphore> = new Map()
   /** Cursor used by `runAny` for round-robin dispatch. */
   private roundRobinIndex = 0
 
@@ -86,6 +94,7 @@ export class AgentPool {
       )
     }
     this.agents.set(agent.name, agent)
+    this.agentLocks.set(agent.name, new Semaphore(1))
   }
 
   /**
@@ -98,6 +107,7 @@ export class AgentPool {
       throw new Error(`AgentPool: agent '${name}' is not registered.`)
     }
     this.agents.delete(name)
+    this.agentLocks.delete(name)
   }
 
   /**
@@ -130,12 +140,20 @@ export class AgentPool {
     runOptions?: Partial<RunOptions>,
   ): Promise<AgentRunResult> {
     const agent = this.requireAgent(agentName)
+    const agentLock = this.agentLocks.get(agentName)!
 
-    await this.semaphore.acquire()
+    // Acquire per-agent lock first so the second call for the same agent waits
+    // here without consuming a pool slot.  Then acquire the pool semaphore.
+    await agentLock.acquire()
     try {
-      return await agent.run(prompt, runOptions)
+      await this.semaphore.acquire()
+      try {
+        return await agent.run(prompt, runOptions)
+      } finally {
+        this.semaphore.release()
+      }
     } finally {
-      this.semaphore.release()
+      agentLock.release()
     }
   }
 
@@ -200,11 +218,18 @@ export class AgentPool {
     const agent = allAgents[this.roundRobinIndex]!
     this.roundRobinIndex = (this.roundRobinIndex + 1) % allAgents.length
 
-    await this.semaphore.acquire()
+    const agentLock = this.agentLocks.get(agent.name)!
+
+    await agentLock.acquire()
     try {
-      return await agent.run(prompt)
+      await this.semaphore.acquire()
+      try {
+        return await agent.run(prompt)
+      } finally {
+        this.semaphore.release()
+      }
     } finally {
-      this.semaphore.release()
+      agentLock.release()
     }
   }
 

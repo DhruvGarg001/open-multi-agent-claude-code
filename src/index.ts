@@ -63,6 +63,7 @@ export type { SchedulingStrategy } from './orchestrator/scheduler.js'
 // ---------------------------------------------------------------------------
 
 export { Agent } from './agent/agent.js'
+export { LoopDetector } from './agent/loop-detector.js'
 export { buildStructuredOutputInstruction, extractJSON, validateOutput } from './agent/structured-output.js'
 export { AgentPool, Semaphore } from './agent/pool.js'
 export type { PoolStatus } from './agent/pool.js'
@@ -97,6 +98,7 @@ export {
   fileReadTool,
   fileWriteTool,
   fileEditTool,
+  globTool,
   grepTool,
 } from './tool/built-in/index.js'
 
@@ -106,6 +108,7 @@ export {
 
 export { createAdapter } from './llm/adapter.js'
 export type { SupportedProvider } from './llm/adapter.js'
+export { TokenBudgetExceededError } from './errors.js'
 
 // ---------------------------------------------------------------------------
 // Memory
@@ -147,7 +150,11 @@ export type {
   AgentConfig,
   AgentState,
   AgentRunResult,
+  BeforeRunHookContext,
   ToolCallRecord,
+  LoopDetectionConfig,
+  LoopDetectionInfo,
+  ContextStrategy,
 
   // Team
   TeamConfig,
@@ -160,6 +167,7 @@ export type {
   // Orchestrator
   OrchestratorConfig,
   OrchestratorEvent,
+  CoordinatorConfig,
 
   // Trace
   TraceEventType,

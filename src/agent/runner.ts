@@ -26,10 +26,33 @@ import type {
   LLMAdapter,
   LLMChatOptions,
   TraceEvent,
+  LoopDetectionConfig,
+  LoopDetectionInfo,
+  LLMToolDef,
+  ContextStrategy,
 } from '../types.js'
+import { TokenBudgetExceededError } from '../errors.js'
+import { LoopDetector } from './loop-detector.js'
 import { emitTrace } from '../utils/trace.js'
+import { estimateTokens } from '../utils/tokens.js'
 import type { ToolRegistry } from '../tool/framework.js'
 import type { ToolExecutor } from '../tool/executor.js'
+
+// ---------------------------------------------------------------------------
+// Tool presets
+// ---------------------------------------------------------------------------
+
+/** Predefined tool sets for common agent use cases. */
+export const TOOL_PRESETS = {
+  readonly: ['file_read', 'grep', 'glob'],
+  readwrite: ['file_read', 'file_write', 'file_edit', 'grep', 'glob'],
+  full: ['file_read', 'file_write', 'file_edit', 'grep', 'glob', 'bash'],
+} as const satisfies Record<string, readonly string[]>
+
+/** Framework-level disallowed tools for safety rails. */
+export const AGENT_FRAMEWORK_DISALLOWED: readonly string[] = [
+  // Empty for now, infrastructure for future built-in tools
+]
 
 // ---------------------------------------------------------------------------
 // Public interfaces
@@ -56,15 +79,25 @@ export interface RunnerOptions {
   /** AbortSignal that cancels any in-flight adapter call and stops the loop. */
   readonly abortSignal?: AbortSignal
   /**
-   * Whitelist of tool names this runner is allowed to use.
-   * When provided, only tools whose name appears in this list are sent to the
-   * LLM. When omitted, all registered tools are available.
+   * Tool access control configuration.
+   * - `toolPreset`: Predefined tool sets for common use cases
+   * - `allowedTools`: Whitelist of tool names (allowlist)
+   * - `disallowedTools`: Blacklist of tool names (denylist)
+   * Tools are resolved in order: preset → allowlist → denylist
    */
+  readonly toolPreset?: 'readonly' | 'readwrite' | 'full'
   readonly allowedTools?: readonly string[]
+  readonly disallowedTools?: readonly string[]
   /** Display name of the agent driving this runner (used in tool context). */
   readonly agentName?: string
   /** Short role description of the agent (used in tool context). */
   readonly agentRole?: string
+  /** Loop detection configuration. When set, detects stuck agent loops. */
+  readonly loopDetection?: LoopDetectionConfig
+  /** Maximum cumulative tokens (input + output) allowed for this run. */
+  readonly maxTokenBudget?: number
+  /** Optional context compression strategy for long multi-turn runs. */
+  readonly contextStrategy?: ContextStrategy
 }
 
 /**
@@ -78,6 +111,11 @@ export interface RunOptions {
   readonly onToolResult?: (name: string, result: ToolResult) => void
   /** Fired after each complete {@link LLMMessage} is appended. */
   readonly onMessage?: (message: LLMMessage) => void
+  /**
+   * Fired when the runner detects a potential configuration issue.
+   * For example, when a model appears to ignore tool definitions.
+   */
+  readonly onWarning?: (message: string) => void
   /** Trace callback for observability spans. Async callbacks are safe. */
   readonly onTrace?: (event: TraceEvent) => void | Promise<void>
   /** Run ID for trace correlation. */
@@ -86,6 +124,11 @@ export interface RunOptions {
   readonly taskId?: string
   /** Agent name for trace correlation (overrides RunnerOptions.agentName). */
   readonly traceAgent?: string
+  /**
+   * Per-call abort signal. When set, takes precedence over the static
+   * {@link RunnerOptions.abortSignal}. Useful for per-run timeouts.
+   */
+  readonly abortSignal?: AbortSignal
 }
 
 /** The aggregated result returned when a full run completes. */
@@ -100,6 +143,10 @@ export interface RunResult {
   readonly tokenUsage: TokenUsage
   /** Total number of LLM turns (including tool-call follow-ups). */
   readonly turns: number
+  /** True when the run was terminated or warned due to loop detection. */
+  readonly loopDetected?: boolean
+  /** True when the run was terminated due to token budget limits. */
+  readonly budgetExceeded?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +176,31 @@ function addTokenUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
 
 const ZERO_USAGE: TokenUsage = { input_tokens: 0, output_tokens: 0 }
 
+/**
+ * Prepends synthetic framing text to the first user message so we never emit
+ * consecutive `user` turns (Bedrock) and summaries do not concatenate onto
+ * the original user prompt (direct API). If there is no user message yet,
+ * inserts a single assistant text preamble.
+ */
+function prependSyntheticPrefixToFirstUser(
+  messages: LLMMessage[],
+  prefix: string,
+): LLMMessage[] {
+  const userIdx = messages.findIndex(m => m.role === 'user')
+  if (userIdx < 0) {
+    return [{
+      role: 'assistant',
+      content: [{ type: 'text', text: prefix.trimEnd() }],
+    }, ...messages]
+  }
+  const target = messages[userIdx]!
+  const merged: LLMMessage = {
+    role: 'user',
+    content: [{ type: 'text', text: prefix }, ...target.content],
+  }
+  return [...messages.slice(0, userIdx), merged, ...messages.slice(userIdx + 1)]
+}
+
 // ---------------------------------------------------------------------------
 // AgentRunner
 // ---------------------------------------------------------------------------
@@ -148,6 +220,10 @@ const ZERO_USAGE: TokenUsage = { input_tokens: 0, output_tokens: 0 }
  */
 export class AgentRunner {
   private readonly maxTurns: number
+  private summarizeCache: {
+    oldSignature: string
+    summaryPrefix: string
+  } | null = null
 
   constructor(
     private readonly adapter: LLMAdapter,
@@ -156,6 +232,238 @@ export class AgentRunner {
     private readonly options: RunnerOptions,
   ) {
     this.maxTurns = options.maxTurns ?? 10
+  }
+
+  private serializeMessage(message: LLMMessage): string {
+    return JSON.stringify(message)
+  }
+
+  private truncateToSlidingWindow(messages: LLMMessage[], maxTurns: number): LLMMessage[] {
+    if (maxTurns <= 0) {
+      return messages
+    }
+
+    const firstUserIndex = messages.findIndex(m => m.role === 'user')
+    const firstUser = firstUserIndex >= 0 ? messages[firstUserIndex]! : null
+    const afterFirst = firstUserIndex >= 0
+      ? messages.slice(firstUserIndex + 1)
+      : messages.slice()
+
+    if (afterFirst.length <= maxTurns * 2) {
+      return messages
+    }
+
+    const kept = afterFirst.slice(-maxTurns * 2)
+    const result: LLMMessage[] = []
+
+    if (firstUser !== null) {
+      result.push(firstUser)
+    }
+
+    const droppedPairs = Math.floor((afterFirst.length - kept.length) / 2)
+    if (droppedPairs > 0) {
+      const notice =
+        `[Earlier conversation history truncated — ${droppedPairs} turn(s) removed]\n\n`
+      result.push(...prependSyntheticPrefixToFirstUser(kept, notice))
+      return result
+    }
+
+    result.push(...kept)
+    return result
+  }
+
+  private async summarizeMessages(
+    messages: LLMMessage[],
+    maxTokens: number,
+    summaryModel: string | undefined,
+    baseChatOptions: LLMChatOptions,
+    turns: number,
+    options: RunOptions,
+  ): Promise<{ messages: LLMMessage[]; usage: TokenUsage }> {
+    const estimated = estimateTokens(messages)
+    if (estimated <= maxTokens || messages.length < 4) {
+      return { messages, usage: ZERO_USAGE }
+    }
+
+    const firstUserIndex = messages.findIndex(m => m.role === 'user')
+    if (firstUserIndex < 0 || firstUserIndex === messages.length - 1) {
+      return { messages, usage: ZERO_USAGE }
+    }
+
+    const firstUser = messages[firstUserIndex]!
+    const rest = messages.slice(firstUserIndex + 1)
+    if (rest.length < 2) {
+      return { messages, usage: ZERO_USAGE }
+    }
+
+    // Split on an even boundary so we never separate a tool_use assistant turn
+    // from its tool_result user message (rest is user/assistant pairs).
+    const splitAt = Math.max(2, Math.floor(rest.length / 4) * 2)
+    const oldPortion = rest.slice(0, splitAt)
+    const recentPortion = rest.slice(splitAt)
+
+    const oldSignature = oldPortion.map(m => this.serializeMessage(m)).join('\n')
+    if (this.summarizeCache !== null && this.summarizeCache.oldSignature === oldSignature) {
+      const mergedRecent = prependSyntheticPrefixToFirstUser(
+        recentPortion,
+        `${this.summarizeCache.summaryPrefix}\n\n`,
+      )
+      return { messages: [firstUser, ...mergedRecent], usage: ZERO_USAGE }
+    }
+
+    const summaryPrompt = [
+      'Summarize the following conversation history for an LLM.',
+      '- Preserve user goals, constraints, and decisions.',
+      '- Keep key tool outputs and unresolved questions.',
+      '- Use concise bullets.',
+      '- Do not fabricate details.',
+    ].join('\n')
+
+    const summaryInput: LLMMessage[] = [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: summaryPrompt },
+          { type: 'text', text: `\n\nConversation:\n${oldSignature}` },
+        ],
+      },
+    ]
+
+    const summaryOptions: LLMChatOptions = {
+      ...baseChatOptions,
+      model: summaryModel ?? this.options.model,
+      tools: undefined,
+    }
+
+    const summaryStartMs = Date.now()
+    const summaryResponse = await this.adapter.chat(summaryInput, summaryOptions)
+    if (options.onTrace) {
+      const summaryEndMs = Date.now()
+      emitTrace(options.onTrace, {
+        type: 'llm_call',
+        runId: options.runId ?? '',
+        taskId: options.taskId,
+        agent: options.traceAgent ?? this.options.agentName ?? 'unknown',
+        model: summaryOptions.model,
+        phase: 'summary',
+        turn: turns,
+        tokens: summaryResponse.usage,
+        startMs: summaryStartMs,
+        endMs: summaryEndMs,
+        durationMs: summaryEndMs - summaryStartMs,
+      })
+    }
+
+    const summaryText = extractText(summaryResponse.content).trim()
+    const summaryPrefix = summaryText.length > 0
+      ? `[Conversation summary]\n${summaryText}`
+      : '[Conversation summary unavailable]'
+
+    this.summarizeCache = { oldSignature, summaryPrefix }
+    const mergedRecent = prependSyntheticPrefixToFirstUser(
+      recentPortion,
+      `${summaryPrefix}\n\n`,
+    )
+    return {
+      messages: [firstUser, ...mergedRecent],
+      usage: summaryResponse.usage,
+    }
+  }
+
+  private async applyContextStrategy(
+    messages: LLMMessage[],
+    strategy: ContextStrategy,
+    baseChatOptions: LLMChatOptions,
+    turns: number,
+    options: RunOptions,
+  ): Promise<{ messages: LLMMessage[]; usage: TokenUsage }> {
+    if (strategy.type === 'sliding-window') {
+      return { messages: this.truncateToSlidingWindow(messages, strategy.maxTurns), usage: ZERO_USAGE }
+    }
+
+    if (strategy.type === 'summarize') {
+      return this.summarizeMessages(
+        messages,
+        strategy.maxTokens,
+        strategy.summaryModel,
+        baseChatOptions,
+        turns,
+        options,
+      )
+    }
+
+    const estimated = estimateTokens(messages)
+    const compressed = await strategy.compress(messages, estimated)
+    if (!Array.isArray(compressed) || compressed.length === 0) {
+      throw new Error('contextStrategy.custom.compress must return a non-empty LLMMessage[]')
+    }
+    return { messages: compressed, usage: ZERO_USAGE }
+  }
+
+  // -------------------------------------------------------------------------
+  // Tool resolution
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve the final set of tools available to this agent based on the
+   * three-layer configuration: preset → allowlist → denylist → framework safety.
+   *
+   * Returns LLMToolDef[] for direct use with LLM adapters.
+   */
+  private resolveTools(): LLMToolDef[] {
+    // Validate configuration for contradictions
+    if (this.options.toolPreset && this.options.allowedTools) {
+      console.warn(
+        'AgentRunner: both toolPreset and allowedTools are set. ' +
+        'Final tool access will be the intersection of both.'
+      )
+    }
+
+    if (this.options.allowedTools && this.options.disallowedTools) {
+      const overlap = this.options.allowedTools.filter(tool =>
+        this.options.disallowedTools!.includes(tool)
+      )
+      if (overlap.length > 0) {
+        console.warn(
+          `AgentRunner: tools [${overlap.map(name => `"${name}"`).join(', ')}] appear in both allowedTools and disallowedTools. ` +
+          'This is contradictory and may lead to unexpected behavior.'
+        )
+      }
+    }
+
+    const allTools = this.toolRegistry.toToolDefs()
+    const runtimeCustomTools = this.toolRegistry.toRuntimeToolDefs()
+    const runtimeCustomToolNames = new Set(runtimeCustomTools.map(t => t.name))
+    let filteredTools = allTools.filter(t => !runtimeCustomToolNames.has(t.name))
+
+    // 1. Apply preset filter if set
+    if (this.options.toolPreset) {
+      const presetTools = new Set(TOOL_PRESETS[this.options.toolPreset] as readonly string[])
+      filteredTools = filteredTools.filter(t => presetTools.has(t.name))
+    }
+
+    // 2. Apply allowlist filter if set
+    if (this.options.allowedTools) {
+      filteredTools = filteredTools.filter(t => this.options.allowedTools!.includes(t.name))
+    }
+
+    // 3. Apply denylist filter if set
+    const denied = this.options.disallowedTools
+      ? new Set(this.options.disallowedTools)
+      : undefined
+    if (denied) {
+      filteredTools = filteredTools.filter(t => !denied.has(t.name))
+    }
+
+    // 4. Apply framework-level safety rails
+    const frameworkDenied = new Set(AGENT_FRAMEWORK_DISALLOWED)
+    filteredTools = filteredTools.filter(t => !frameworkDenied.has(t.name))
+
+    // Runtime-added custom tools bypass preset / allowlist but respect denylist.
+    const finalRuntime = denied
+      ? runtimeCustomTools.filter(t => !denied.has(t.name))
+      : runtimeCustomTools
+    return [...filteredTools, ...finalRuntime]
   }
 
   // -------------------------------------------------------------------------
@@ -176,13 +484,7 @@ export class AgentRunner {
     options: RunOptions = {},
   ): Promise<RunResult> {
     // Collect everything yielded by the internal streaming loop.
-    const accumulated: {
-      messages: LLMMessage[]
-      output: string
-      toolCalls: ToolCallRecord[]
-      tokenUsage: TokenUsage
-      turns: number
-    } = {
+    const accumulated: RunResult = {
       messages: [],
       output: '',
       toolCalls: [],
@@ -192,12 +494,9 @@ export class AgentRunner {
 
     for await (const event of this.stream(messages, options)) {
       if (event.type === 'done') {
-        const result = event.data as RunResult
-        accumulated.messages = result.messages
-        accumulated.output = result.output
-        accumulated.toolCalls = result.toolCalls
-        accumulated.tokenUsage = result.tokenUsage
-        accumulated.turns = result.turns
+        Object.assign(accumulated, event.data)
+      } else if (event.type === 'error') {
+        throw event.data
       }
     }
 
@@ -211,6 +510,7 @@ export class AgentRunner {
    *  - `{ type: 'text', data: string }` for each text delta
    *  - `{ type: 'tool_use', data: ToolUseBlock }` when the model requests a tool
    *  - `{ type: 'tool_result', data: ToolResultBlock }` after each execution
+ *  - `{ type: 'budget_exceeded', data: TokenBudgetExceededError }` on budget trip
    *  - `{ type: 'done', data: RunResult }` at the very end
    *  - `{ type: 'error', data: Error }` on unrecoverable failure
    */
@@ -219,21 +519,21 @@ export class AgentRunner {
     options: RunOptions = {},
   ): AsyncGenerator<StreamEvent> {
     // Working copy of the conversation — mutated as turns progress.
-    const conversationMessages: LLMMessage[] = [...initialMessages]
+    let conversationMessages: LLMMessage[] = [...initialMessages]
 
     // Accumulated state across all turns.
     let totalUsage: TokenUsage = ZERO_USAGE
     const allToolCalls: ToolCallRecord[] = []
     let finalOutput = ''
     let turns = 0
+    let budgetExceeded = false
 
     // Build the stable LLM options once; model / tokens / temp don't change.
-    // toToolDefs() returns LLMToolDef[] (inputSchema, camelCase) — matches
-    // LLMChatOptions.tools from types.ts directly.
-    const allDefs = this.toolRegistry.toToolDefs()
-    const toolDefs = this.options.allowedTools
-      ? allDefs.filter(d => this.options.allowedTools!.includes(d.name))
-      : allDefs
+    // resolveTools() returns LLMToolDef[] with three-layer filtering applied.
+    const toolDefs = this.resolveTools()
+
+    // Per-call abortSignal takes precedence over the static one.
+    const effectiveAbortSignal = options.abortSignal ?? this.options.abortSignal
 
     const baseChatOptions: LLMChatOptions = {
       model: this.options.model,
@@ -241,8 +541,16 @@ export class AgentRunner {
       maxTokens: this.options.maxTokens,
       temperature: this.options.temperature,
       systemPrompt: this.options.systemPrompt,
-      abortSignal: this.options.abortSignal,
+      abortSignal: effectiveAbortSignal,
     }
+
+    // Loop detection state — only allocated when configured.
+    const detector = this.options.loopDetection
+      ? new LoopDetector(this.options.loopDetection)
+      : null
+    let loopDetected = false
+    let loopWarned = false
+    const loopAction = this.options.loopDetection?.onLoopDetected ?? 'warn'
 
     try {
       // -----------------------------------------------------------------
@@ -250,7 +558,7 @@ export class AgentRunner {
       // -----------------------------------------------------------------
       while (true) {
         // Respect abort before each LLM call.
-        if (this.options.abortSignal?.aborted) {
+        if (effectiveAbortSignal?.aborted) {
           break
         }
 
@@ -260,6 +568,19 @@ export class AgentRunner {
         }
 
         turns++
+
+        // Optionally compact context before each LLM call after the first turn.
+        if (this.options.contextStrategy && turns > 1) {
+          const compacted = await this.applyContextStrategy(
+            conversationMessages,
+            this.options.contextStrategy,
+            baseChatOptions,
+            turns,
+            options,
+          )
+          conversationMessages = compacted.messages
+          totalUsage = addTokenUsage(totalUsage, compacted.usage)
+        }
 
         // ------------------------------------------------------------------
         // Step 1: Call the LLM and collect the full response for this turn.
@@ -274,6 +595,7 @@ export class AgentRunner {
             taskId: options.taskId,
             agent: options.traceAgent ?? this.options.agentName ?? 'unknown',
             model: this.options.model,
+            phase: 'turn',
             turn: turns,
             tokens: response.usage,
             startMs: llmStartMs,
@@ -301,19 +623,90 @@ export class AgentRunner {
           yield { type: 'text', data: turnText } satisfies StreamEvent
         }
 
-        // Announce each tool-use block the model requested.
+        const totalTokens = totalUsage.input_tokens + totalUsage.output_tokens
+        if (this.options.maxTokenBudget !== undefined && totalTokens > this.options.maxTokenBudget) {
+          budgetExceeded = true
+          finalOutput = turnText
+          yield {
+            type: 'budget_exceeded',
+            data: new TokenBudgetExceededError(
+              this.options.agentName ?? 'unknown',
+              totalTokens,
+              this.options.maxTokenBudget,
+            ),
+          } satisfies StreamEvent
+          break
+        }
+
+        // Extract tool-use blocks for detection and execution.
         const toolUseBlocks = extractToolUseBlocks(response.content)
-        for (const block of toolUseBlocks) {
-          yield { type: 'tool_use', data: block } satisfies StreamEvent
+
+        // ------------------------------------------------------------------
+        // Step 2.5: Loop detection — check before yielding tool_use events
+        // so that terminate mode doesn't emit orphaned tool_use without
+        // matching tool_result.
+        // ------------------------------------------------------------------
+        let injectWarning = false
+        let injectWarningKind: 'tool_repetition' | 'text_repetition' = 'tool_repetition'
+        if (detector && toolUseBlocks.length > 0) {
+          const toolInfo = detector.recordToolCalls(toolUseBlocks)
+          const textInfo = turnText.length > 0 ? detector.recordText(turnText) : null
+          const info = toolInfo ?? textInfo
+
+          if (info) {
+            yield { type: 'loop_detected', data: info } satisfies StreamEvent
+            options.onWarning?.(info.detail)
+
+            const action = typeof loopAction === 'function'
+              ? await loopAction(info)
+              : loopAction
+
+            if (action === 'terminate') {
+              loopDetected = true
+              finalOutput = turnText
+              break
+            } else if (action === 'warn' || action === 'inject') {
+              if (loopWarned) {
+                // Second detection after a warning — force terminate.
+                loopDetected = true
+                finalOutput = turnText
+                break
+              }
+              loopWarned = true
+              injectWarning = true
+              injectWarningKind = info.kind
+              // Fall through to execute tools, then inject warning.
+            }
+            // 'continue' — do nothing, let the loop proceed normally.
+          } else {
+            // No loop detected this turn — agent has recovered, so reset
+            // the warning state. A future loop gets a fresh warning cycle.
+            loopWarned = false
+          }
         }
 
         // ------------------------------------------------------------------
         // Step 3: Decide whether to continue looping.
         // ------------------------------------------------------------------
         if (toolUseBlocks.length === 0) {
+          // Warn on first turn if tools were provided but model didn't use them.
+          if (turns === 1 && toolDefs.length > 0 && options.onWarning) {
+            const agentName = this.options.agentName ?? 'unknown'
+            options.onWarning(
+              `Agent "${agentName}" has ${toolDefs.length} tool(s) available but the model ` +
+              `returned no tool calls. If using a local model, verify it supports tool calling ` +
+              `(see https://ollama.com/search?c=tools).`,
+            )
+          }
           // No tools requested — this is the terminal assistant turn.
           finalOutput = turnText
           break
+        }
+
+        // Announce each tool-use block the model requested (after loop
+        // detection, so terminate mode never emits unpaired events).
+        for (const block of toolUseBlocks) {
+          yield { type: 'tool_use', data: block } satisfies StreamEvent
         }
 
         // ------------------------------------------------------------------
@@ -322,7 +715,7 @@ export class AgentRunner {
         // Parallel execution is critical for multi-tool responses where the
         // tools are independent (e.g. reading several files at once).
         // ------------------------------------------------------------------
-        const toolContext: ToolUseContext = this.buildToolContext()
+        const toolContext: ToolUseContext = this.buildToolContext(effectiveAbortSignal)
 
         const executionPromises = toolUseBlocks.map(async (block): Promise<{
           resultBlock: ToolResultBlock
@@ -395,6 +788,20 @@ export class AgentRunner {
           yield { type: 'tool_result', data: resultBlock } satisfies StreamEvent
         }
 
+        // Inject a loop-detection warning into the tool-result message so
+        // the LLM sees it alongside the results (avoids two consecutive user
+        // messages which violates the alternating-role constraint).
+        if (injectWarning) {
+          const warningText = injectWarningKind === 'text_repetition'
+            ? 'WARNING: You appear to be generating the same response repeatedly. ' +
+              'This suggests you are stuck in a loop. Please try a different approach ' +
+              'or provide new information.'
+            : 'WARNING: You appear to be repeating the same tool calls with identical arguments. ' +
+              'This suggests you are stuck in a loop. Please try a different approach, use different ' +
+              'parameters, or explain what you are trying to accomplish.'
+          toolResultBlocks.push({ type: 'text' as const, text: warningText })
+        }
+
         const toolResultMessage: LLMMessage = {
           role: 'user',
           content: toolResultBlocks,
@@ -428,6 +835,8 @@ export class AgentRunner {
       toolCalls: allToolCalls,
       tokenUsage: totalUsage,
       turns,
+      ...(loopDetected ? { loopDetected: true } : {}),
+      ...(budgetExceeded ? { budgetExceeded: true } : {}),
     }
 
     yield { type: 'done', data: runResult } satisfies StreamEvent
@@ -441,14 +850,14 @@ export class AgentRunner {
    * Build the {@link ToolUseContext} passed to every tool execution.
    * Identifies this runner as the invoking agent.
    */
-  private buildToolContext(): ToolUseContext {
+  private buildToolContext(abortSignal?: AbortSignal): ToolUseContext {
     return {
       agent: {
         name: this.options.agentName ?? 'runner',
         role: this.options.agentRole ?? 'assistant',
         model: this.options.model,
       },
-      abortSignal: this.options.abortSignal,
+      abortSignal,
     }
   }
 }

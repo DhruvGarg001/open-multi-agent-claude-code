@@ -27,6 +27,7 @@ import type {
   AgentConfig,
   AgentState,
   AgentRunResult,
+  BeforeRunHookContext,
   LLMMessage,
   StreamEvent,
   TokenUsage,
@@ -48,6 +49,19 @@ import {
 // ---------------------------------------------------------------------------
 
 const ZERO_USAGE: TokenUsage = { input_tokens: 0, output_tokens: 0 }
+
+/**
+ * Combine two {@link AbortSignal}s so that aborting either one cancels the
+ * returned signal.  Works on Node 18+ (no `AbortSignal.any` required).
+ */
+function mergeAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
+  const controller = new AbortController()
+  if (a.aborted || b.aborted) { controller.abort(); return controller.signal }
+  const abort = () => controller.abort()
+  a.addEventListener('abort', abort, { once: true })
+  b.addEventListener('abort', abort, { once: true })
+  return controller.signal
+}
 
 function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
   return {
@@ -132,9 +146,14 @@ export class Agent {
       maxTurns: this.config.maxTurns,
       maxTokens: this.config.maxTokens,
       temperature: this.config.temperature,
+      toolPreset: this.config.toolPreset,
       allowedTools: this.config.tools,
+      disallowedTools: this.config.disallowedTools,
       agentName: this.name,
       agentRole: this.config.systemPrompt?.slice(0, 50) ?? 'assistant',
+      loopDetection: this.config.loopDetection,
+      maxTokenBudget: this.config.maxTokenBudget,
+      contextStrategy: this.config.contextStrategy,
     }
 
     this.runner = new AgentRunner(
@@ -245,7 +264,7 @@ export class Agent {
    * The tool becomes available to the next LLM call — no restart required.
    */
   addTool(tool: FrameworkToolDefinition): void {
-    this._toolRegistry.register(tool)
+    this._toolRegistry.register(tool, { runtimeAdded: true })
   }
 
   /**
@@ -278,6 +297,13 @@ export class Agent {
     const agentStartMs = Date.now()
 
     try {
+      // --- beforeRun hook ---
+      if (this.config.beforeRun) {
+        const hookCtx = this.buildBeforeRunHookContext(messages)
+        const modified = await this.config.beforeRun(hookCtx)
+        this.applyHookContext(messages, modified, hookCtx.prompt)
+      }
+
       const runner = await this.getRunner()
       const internalOnMessage = (msg: LLMMessage) => {
         this.state.messages.push(msg)
@@ -285,29 +311,61 @@ export class Agent {
       }
       // Auto-generate runId when onTrace is provided but runId is missing
       const needsRunId = callerOptions?.onTrace && !callerOptions.runId
+      // Create a fresh timeout signal per run (not per runner) so that
+      // each run() / prompt() call gets its own timeout window.
+      const timeoutSignal = this.config.timeoutMs !== undefined && this.config.timeoutMs > 0
+        ? AbortSignal.timeout(this.config.timeoutMs)
+        : undefined
+      // Merge caller-provided abortSignal with the timeout signal so that
+      // either cancellation source is respected.
+      const callerAbort = callerOptions?.abortSignal
+      const effectiveAbort = timeoutSignal && callerAbort
+        ? mergeAbortSignals(timeoutSignal, callerAbort)
+        : timeoutSignal ?? callerAbort
       const runOptions: RunOptions = {
         ...callerOptions,
         onMessage: internalOnMessage,
         ...(needsRunId ? { runId: generateRunId() } : undefined),
+        ...(effectiveAbort ? { abortSignal: effectiveAbort } : undefined),
       }
 
       const result = await runner.run(messages, runOptions)
       this.state.tokenUsage = addUsage(this.state.tokenUsage, result.tokenUsage)
 
+      if (result.budgetExceeded) {
+        let budgetResult = this.toAgentRunResult(result, false)
+        if (this.config.afterRun) {
+          budgetResult = await this.config.afterRun(budgetResult)
+        }
+        this.transitionTo('completed')
+        this.emitAgentTrace(callerOptions, agentStartMs, budgetResult)
+        return budgetResult
+      }
+
       // --- Structured output validation ---
       if (this.config.outputSchema) {
-        const validated = await this.validateStructuredOutput(
+        let validated = await this.validateStructuredOutput(
           messages,
           result,
           runner,
           runOptions,
         )
+        // --- afterRun hook ---
+        if (this.config.afterRun) {
+          validated = await this.config.afterRun(validated)
+        }
         this.emitAgentTrace(callerOptions, agentStartMs, validated)
         return validated
       }
 
+      let agentResult = this.toAgentRunResult(result, true)
+
+      // --- afterRun hook ---
+      if (this.config.afterRun) {
+        agentResult = await this.config.afterRun(agentResult)
+      }
+
       this.transitionTo('completed')
-      const agentResult = this.toAgentRunResult(result, true)
       this.emitAgentTrace(callerOptions, agentStartMs, agentResult)
       return agentResult
     } catch (err) {
@@ -417,6 +475,7 @@ export class Agent {
         tokenUsage: mergedTokenUsage,
         toolCalls: mergedToolCalls,
         structured: validated,
+        ...(retryResult.budgetExceeded ? { budgetExceeded: true } : {}),
       }
     } catch {
       // Retry also failed
@@ -428,6 +487,7 @@ export class Agent {
         tokenUsage: mergedTokenUsage,
         toolCalls: mergedToolCalls,
         structured: undefined,
+        ...(retryResult.budgetExceeded ? { budgetExceeded: true } : {}),
       }
     }
   }
@@ -440,13 +500,31 @@ export class Agent {
     this.transitionTo('running')
 
     try {
-      const runner = await this.getRunner()
+      // --- beforeRun hook ---
+      if (this.config.beforeRun) {
+        const hookCtx = this.buildBeforeRunHookContext(messages)
+        const modified = await this.config.beforeRun(hookCtx)
+        this.applyHookContext(messages, modified, hookCtx.prompt)
+      }
 
-      for await (const event of runner.stream(messages)) {
+      const runner = await this.getRunner()
+      // Fresh timeout per stream call, same as executeRun.
+      const timeoutSignal = this.config.timeoutMs !== undefined && this.config.timeoutMs > 0
+        ? AbortSignal.timeout(this.config.timeoutMs)
+        : undefined
+
+      for await (const event of runner.stream(messages, timeoutSignal ? { abortSignal: timeoutSignal } : {})) {
         if (event.type === 'done') {
           const result = event.data as import('./runner.js').RunResult
           this.state.tokenUsage = addUsage(this.state.tokenUsage, result.tokenUsage)
+
+          let agentResult = this.toAgentRunResult(result, !result.budgetExceeded)
+          if (this.config.afterRun) {
+            agentResult = await this.config.afterRun(agentResult)
+          }
           this.transitionTo('completed')
+          yield { type: 'done', data: agentResult } satisfies StreamEvent
+          continue
         } else if (event.type === 'error') {
           const error = event.data instanceof Error
             ? event.data
@@ -460,6 +538,50 @@ export class Agent {
       const error = err instanceof Error ? err : new Error(String(err))
       this.transitionToError(error)
       yield { type: 'error', data: error } satisfies StreamEvent
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Hook helpers
+  // -------------------------------------------------------------------------
+
+  /** Extract the prompt text from the last user message to build hook context. */
+  private buildBeforeRunHookContext(messages: LLMMessage[]): BeforeRunHookContext {
+    let prompt = ''
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]!.role === 'user') {
+        prompt = messages[i]!.content
+          .filter((b): b is import('../types.js').TextBlock => b.type === 'text')
+          .map(b => b.text)
+          .join('')
+        break
+      }
+    }
+    // Strip hook functions to avoid circular self-references in the context
+    const { beforeRun, afterRun, ...agentInfo } = this.config
+    return { prompt, agent: agentInfo as AgentConfig }
+  }
+
+  /**
+   * Apply a (possibly modified) hook context back to the messages array.
+   *
+   * Only text blocks in the last user message are replaced; non-text content
+   * (images, tool results) is preserved. The array element is replaced (not
+   * mutated in place) so that shallow copies of the original array (e.g. from
+   * `prompt()`) are not affected.
+   */
+  private applyHookContext(messages: LLMMessage[], ctx: BeforeRunHookContext, originalPrompt: string): void {
+    if (ctx.prompt === originalPrompt) return
+
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]!.role === 'user') {
+        const nonTextBlocks = messages[i]!.content.filter(b => b.type !== 'text')
+        messages[i] = {
+          role: 'user',
+          content: [{ type: 'text', text: ctx.prompt }, ...nonTextBlocks],
+        }
+        break
+      }
     }
   }
 
@@ -491,6 +613,8 @@ export class Agent {
       tokenUsage: result.tokenUsage,
       toolCalls: result.toolCalls,
       structured,
+      ...(result.loopDetected ? { loopDetected: true } : {}),
+      ...(result.budgetExceeded ? { budgetExceeded: true } : {}),
     }
   }
 

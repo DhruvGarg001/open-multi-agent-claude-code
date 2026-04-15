@@ -11,9 +11,10 @@ import { bashTool } from './bash.js'
 import { fileEditTool } from './file-edit.js'
 import { fileReadTool } from './file-read.js'
 import { fileWriteTool } from './file-write.js'
+import { globTool } from './glob.js'
 import { grepTool } from './grep.js'
 
-export { bashTool, fileEditTool, fileReadTool, fileWriteTool, grepTool }
+export { bashTool, fileEditTool, fileReadTool, fileWriteTool, globTool, grepTool }
 
 /**
  * The ordered list of all built-in tools.  Import this when you need to
@@ -29,6 +30,7 @@ export const BUILT_IN_TOOLS: ToolDefinition<any>[] = [
   fileWriteTool,
   fileEditTool,
   grepTool,
+  globTool,
 ]
 
 /**

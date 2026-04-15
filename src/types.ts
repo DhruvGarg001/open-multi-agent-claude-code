@@ -65,6 +65,18 @@ export interface LLMMessage {
   readonly content: ContentBlock[]
 }
 
+/** Context management strategy for long-running agent conversations. */
+export type ContextStrategy =
+  | { type: 'sliding-window'; maxTurns: number }
+  | { type: 'summarize'; maxTokens: number; summaryModel?: string }
+  | {
+    type: 'custom'
+    compress: (
+      messages: LLMMessage[],
+      estimatedTokens: number,
+    ) => Promise<LLMMessage[]> | LLMMessage[]
+  }
+
 /** Token accounting for a single API call. */
 export interface TokenUsage {
   readonly input_tokens: number
@@ -90,11 +102,12 @@ export interface LLMResponse {
  * - `text`        — incremental text delta
  * - `tool_use`    — the model has begun or completed a tool-use block
  * - `tool_result` — a tool result has been appended to the stream
+ * - `budget_exceeded` — token budget threshold reached for this run
  * - `done`        — the stream has ended; `data` is the final {@link LLMResponse}
  * - `error`       — an unrecoverable error occurred; `data` is an `Error`
  */
 export interface StreamEvent {
-  readonly type: 'text' | 'tool_use' | 'tool_result' | 'done' | 'error'
+  readonly type: 'text' | 'tool_use' | 'tool_result' | 'loop_detected' | 'budget_exceeded' | 'done' | 'error'
   readonly data: unknown
 }
 
@@ -169,12 +182,18 @@ export interface ToolResult {
  * A tool registered with the framework.
  *
  * `inputSchema` is a Zod schema used for validation before `execute` is called.
- * At API call time it is converted to JSON Schema via {@link LLMToolDef}.
+ * At API call time it is converted to JSON Schema for {@link LLMToolDef}, unless
+ * `llmInputSchema` is set (e.g. MCP tools ship JSON Schema from the server).
  */
 export interface ToolDefinition<TInput = Record<string, unknown>> {
   readonly name: string
   readonly description: string
   readonly inputSchema: ZodSchema<TInput>
+  /**
+   * When present, used as {@link LLMToolDef.inputSchema} as-is instead of
+   * deriving JSON Schema from `inputSchema` (Zod).
+   */
+  readonly llmInputSchema?: Record<string, unknown>
   execute(input: TInput, context: ToolUseContext): Promise<ToolResult>
 }
 
@@ -182,11 +201,19 @@ export interface ToolDefinition<TInput = Record<string, unknown>> {
 // Agent
 // ---------------------------------------------------------------------------
 
+/** Context passed to the {@link AgentConfig.beforeRun} hook. */
+export interface BeforeRunHookContext {
+  /** The user prompt text. */
+  readonly prompt: string
+  /** The agent's static configuration. */
+  readonly agent: AgentConfig
+}
+
 /** Static configuration for a single agent. */
 export interface AgentConfig {
   readonly name: string
   readonly model: string
-  readonly provider?: 'anthropic' | 'copilot' | 'openai'
+  readonly provider?: 'anthropic' | 'copilot' | 'grok' | 'openai' | 'gemini'
   /**
    * Custom base URL for OpenAI-compatible APIs (Ollama, vLLM, LM Studio, etc.).
    * Note: local servers that don't require auth still need `apiKey` set to a
@@ -196,17 +223,93 @@ export interface AgentConfig {
   /** API key override; falls back to the provider's standard env var. */
   readonly apiKey?: string
   readonly systemPrompt?: string
+  /**
+   * Custom tool definitions to register alongside built-in tools.
+   * Created via `defineTool()`. Custom tools bypass `tools` (allowlist)
+   * and `toolPreset` filtering, but can still be blocked by `disallowedTools`.
+   *
+   * Tool names must not collide with built-in tool names; a duplicate name
+   * will throw at registration time.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  readonly customTools?: readonly ToolDefinition<any>[]
   /** Names of tools (from the tool registry) available to this agent. */
   readonly tools?: readonly string[]
+  /** Names of tools explicitly disallowed for this agent. */
+  readonly disallowedTools?: readonly string[]
+  /** Predefined tool preset for common use cases. */
+  readonly toolPreset?: 'readonly' | 'readwrite' | 'full'
   readonly maxTurns?: number
   readonly maxTokens?: number
+  /** Maximum cumulative tokens (input + output) allowed for this run. */
+  readonly maxTokenBudget?: number
+  /** Optional context compression policy to control input growth across turns. */
+  readonly contextStrategy?: ContextStrategy
   readonly temperature?: number
+  /**
+   * Maximum wall-clock time (in milliseconds) for the entire agent run.
+   * When exceeded, the run is aborted via `AbortSignal.timeout()`.
+   * Useful for local models where inference can be unpredictably slow.
+   */
+  readonly timeoutMs?: number
+  /**
+   * Loop detection configuration. When set, the agent tracks repeated tool
+   * calls and text outputs to detect stuck loops before `maxTurns` is reached.
+   */
+  readonly loopDetection?: LoopDetectionConfig
   /**
    * Optional Zod schema for structured output.  When set, the agent's final
    * output is parsed as JSON and validated against this schema.  A single
    * retry with error feedback is attempted on validation failure.
    */
   readonly outputSchema?: ZodSchema
+  /**
+   * Called before each agent run. Receives the prompt and agent config.
+   * Return a (possibly modified) context to continue, or throw to abort the run.
+   * Only `prompt` from the returned context is applied; `agent` is read-only informational.
+   */
+  readonly beforeRun?: (context: BeforeRunHookContext) => Promise<BeforeRunHookContext> | BeforeRunHookContext
+  /**
+   * Called after each agent run completes successfully. Receives the run result.
+   * Return a (possibly modified) result, or throw to mark the run as failed.
+   * Not called when the run throws. For error observation, handle errors at the call site.
+   */
+  readonly afterRun?: (result: AgentRunResult) => Promise<AgentRunResult> | AgentRunResult
+}
+
+// ---------------------------------------------------------------------------
+// Loop detection
+// ---------------------------------------------------------------------------
+
+/** Configuration for agent loop detection. */
+export interface LoopDetectionConfig {
+  /**
+   * Maximum consecutive times the same tool call (name + args) or text
+   * output can repeat before detection triggers. Default: `3`.
+   */
+  readonly maxRepetitions?: number
+  /**
+   * Number of recent turns to track for repetition analysis. Default: `4`.
+   */
+  readonly loopDetectionWindow?: number
+  /**
+   * Action to take when a loop is detected.
+   * - `'warn'`      — inject a "you appear stuck" message, give the LLM one
+   *                    more chance; terminate if the loop persists (default)
+   * - `'terminate'` — stop the run immediately
+   * - `function`    — custom callback (sync or async); return `'continue'`,
+   *                    `'inject'`, or `'terminate'` to control the outcome
+   */
+  readonly onLoopDetected?: 'warn' | 'terminate' | ((info: LoopDetectionInfo) => 'continue' | 'inject' | 'terminate' | Promise<'continue' | 'inject' | 'terminate'>)
+}
+
+/** Diagnostic payload emitted when a loop is detected. */
+export interface LoopDetectionInfo {
+  readonly kind: 'tool_repetition' | 'text_repetition'
+  /** Number of consecutive identical occurrences observed. */
+  readonly repetitions: number
+  /** Human-readable description of the detected loop. */
+  readonly detail: string
 }
 
 /** Lifecycle state tracked during an agent run. */
@@ -239,6 +342,10 @@ export interface AgentRunResult {
    * failed after retry.
    */
   readonly structured?: unknown
+  /** True when the run was terminated or warned due to loop detection. */
+  readonly loopDetected?: boolean
+  /** True when the run stopped because token budget was exceeded. */
+  readonly budgetExceeded?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +373,7 @@ export interface TeamRunResult {
 // ---------------------------------------------------------------------------
 
 /** Valid states for a {@link Task}. */
-export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'blocked'
+export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'blocked' | 'skipped'
 
 /** A discrete unit of work tracked by the orchestrator. */
 export interface Task {
@@ -278,6 +385,12 @@ export interface Task {
   assignee?: string
   /** IDs of tasks that must complete before this one can start. */
   dependsOn?: readonly string[]
+  /**
+   * Controls what prior team context is injected into this task's prompt.
+   * - `dependencies` (default): only direct dependency task results
+   * - `all`: full shared-memory summary
+   */
+  readonly memoryScope?: 'dependencies' | 'all'
   result?: string
   readonly createdAt: Date
   updatedAt: Date
@@ -293,14 +406,21 @@ export interface Task {
 // Orchestrator
 // ---------------------------------------------------------------------------
 
-/** Progress event emitted by the orchestrator during a run. */
+/**
+ * Progress event emitted by the orchestrator during a run.
+ *
+ * **v0.3 addition:** `'task_skipped'` — consumers with exhaustive switches
+ * on `type` will need to add a case for this variant.
+ */
 export interface OrchestratorEvent {
   readonly type:
     | 'agent_start'
     | 'agent_complete'
     | 'task_start'
     | 'task_complete'
+    | 'task_skipped'
     | 'task_retry'
+    | 'budget_exceeded'
     | 'message'
     | 'error'
   readonly agent?: string
@@ -311,12 +431,68 @@ export interface OrchestratorEvent {
 /** Top-level configuration for the orchestrator. */
 export interface OrchestratorConfig {
   readonly maxConcurrency?: number
+  /** Maximum cumulative tokens (input + output) allowed per orchestrator run. */
+  readonly maxTokenBudget?: number
   readonly defaultModel?: string
-  readonly defaultProvider?: 'anthropic' | 'copilot' | 'openai'
+  readonly defaultProvider?: 'anthropic' | 'copilot' | 'grok' | 'openai' | 'gemini'
   readonly defaultBaseURL?: string
   readonly defaultApiKey?: string
   readonly onProgress?: (event: OrchestratorEvent) => void
   readonly onTrace?: (event: TraceEvent) => void | Promise<void>
+  /**
+   * Optional approval gate called between task execution rounds.
+   *
+   * After a batch of tasks completes, this callback receives all
+   * completed {@link Task}s from that round and the list of tasks about
+   * to start next. Return `true` to continue or `false` to abort —
+   * remaining tasks will be marked `'skipped'`.
+   *
+   * Not called when:
+   * - No tasks succeeded in the round (all failed).
+   * - No pending tasks remain after the round (final batch).
+   *
+   * **Note:** Do not mutate the {@link Task} objects passed to this
+   * callback — they are live references to queue state. Mutation is
+   * undefined behavior.
+   */
+  readonly onApproval?: (completedTasks: readonly Task[], nextTasks: readonly Task[]) => Promise<boolean>
+}
+
+/**
+ * Optional overrides for the temporary coordinator agent created by `runTeam`.
+ *
+ * All fields are optional. Unset fields fall back to orchestrator defaults
+ * (or coordinator built-in defaults where applicable).
+ */
+export interface CoordinatorConfig {
+  /** Coordinator model. Defaults to `OrchestratorConfig.defaultModel`. */
+  readonly model?: string
+  readonly provider?: 'anthropic' | 'copilot' | 'grok' | 'openai' | 'gemini'
+  readonly baseURL?: string
+  readonly apiKey?: string
+  /**
+   * Full system prompt override. When set, this replaces the default
+   * coordinator preamble and decomposition guidance.
+   *
+   * Team roster, output format, and synthesis sections are still appended.
+   */
+  readonly systemPrompt?: string
+  /**
+   * Additional instructions appended to the default coordinator prompt.
+   * Ignored when `systemPrompt` is provided.
+   */
+  readonly instructions?: string
+  readonly maxTurns?: number
+  readonly maxTokens?: number
+  readonly temperature?: number
+  /** Predefined tool preset for common coordinator use cases. */
+  readonly toolPreset?: 'readonly' | 'readwrite' | 'full'
+  /** Tool names available to the coordinator. */
+  readonly tools?: readonly string[]
+  /** Tool names explicitly denied to the coordinator. */
+  readonly disallowedTools?: readonly string[]
+  readonly loopDetection?: LoopDetectionConfig
+  readonly timeoutMs?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +523,8 @@ export interface TraceEventBase {
 export interface LLMCallTrace extends TraceEventBase {
   readonly type: 'llm_call'
   readonly model: string
+  /** Distinguishes normal turn calls from context-summary calls. */
+  readonly phase?: 'turn' | 'summary'
   readonly turn: number
   readonly tokens: TokenUsage
 }
